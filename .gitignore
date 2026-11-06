@@ -1,0 +1,25 @@
+# Secrets — never commit
+plan-jwt.json
+data/accounts.json
+data/*-jwt.json
+*.jwt
+.env
+
+# Build output
+/zcode-gateway
+/zcode-gateway.exe
+/zcode-gateway-*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Release staging
+/dist
+
+# Local credentials and helper scripts — never commit
+credentials.js
+scripts/
+*.log
+*.exe
+zcode-bridge*
