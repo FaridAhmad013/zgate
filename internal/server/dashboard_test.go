@@ -70,10 +70,14 @@ func TestDashboardUIAndAuthFlow(t *testing.T) {
 		t.Fatalf("expected 200 with session cookie, got %d", wStatusAuth.Code)
 	}
 
-	// 5. Verify HTML UI does not contain emojis
+	// 5. Verify HTML UI does not contain emojis (requires session cookie when GATEWAY_ADMIN_KEY is set)
 	reqUI := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:20131/dashboard", nil)
+	reqUI.AddCookie(sessionCookie)
 	wUI := httptest.NewRecorder()
 	Route().ServeHTTP(wUI, reqUI)
+	if wUI.Code != http.StatusOK {
+		t.Fatalf("expected 200 for dashboard with session cookie, got %d", wUI.Code)
+	}
 	if !strings.Contains(wUI.Body.String(), "<svg") {
 		t.Fatal("expected dashboard HTML to use SVG icons")
 	}

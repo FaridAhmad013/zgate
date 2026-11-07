@@ -88,8 +88,176 @@ func isDashboardAuthorized(r *http.Request) bool {
 	return false
 }
 
+const loginPageHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ZGate - System Access Locked</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-chassis: #141413;
+      --bg-module: #1b1b19;
+      --bg-screen: #0c0d0c;
+      --border-groove: #090908;
+      --border-strong: #33332f;
+      --orange: #ff5500;
+      --orange-shadow: #b33c00;
+      --text-main: #f0f0ea;
+      --text-dim: #73736c;
+      --led-red: #ff1744;
+      --font-mono: 'JetBrains Mono', monospace;
+      --font-sans: 'Space Grotesk', sans-serif;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: var(--bg-chassis);
+      background-image: radial-gradient(#262622 1px, transparent 1px);
+      background-size: 16px 16px;
+      color: var(--text-main);
+      font-family: var(--font-sans);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .login-chassis {
+      background: var(--bg-module);
+      border: 1px solid var(--border-strong);
+      box-shadow: 0 8px 0 var(--border-groove), 0 25px 50px rgba(0,0,0,0.8);
+      border-radius: 4px;
+      width: 100%;
+      max-width: 380px;
+      padding: 24px;
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 2px solid var(--border-groove);
+      padding-bottom: 14px;
+      margin-bottom: 20px;
+    }
+    .brand {
+      font-family: var(--font-mono);
+      font-weight: 700;
+      font-size: 14px;
+      letter-spacing: 0.08em;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .badge {
+      background: #261616;
+      border: 1px solid rgba(255, 23, 68, 0.4);
+      color: var(--led-red);
+      font-family: var(--font-mono);
+      font-size: 10px;
+      padding: 2px 6px;
+      border-radius: 2px;
+    }
+    .input {
+      background: var(--bg-screen);
+      border: 1px solid #2f332f;
+      box-shadow: inset 0 2px 6px rgba(0,0,0,0.8);
+      border-radius: 2px;
+      padding: 12px 14px;
+      color: var(--text-main);
+      font-family: var(--font-mono);
+      font-size: 13px;
+      width: 100%;
+      margin-bottom: 16px;
+      outline: none;
+    }
+    .input:focus { border-color: var(--orange); }
+    .btn {
+      background: var(--orange);
+      color: #0d0d0c;
+      border: 1px solid #ff7733;
+      border-radius: 2px;
+      padding: 10px;
+      width: 100%;
+      font-size: 12px;
+      font-weight: 700;
+      font-family: var(--font-mono);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      cursor: pointer;
+      box-shadow: 0 3px 0 var(--orange-shadow);
+    }
+    .btn:active {
+      transform: translateY(2px);
+      box-shadow: 0 1px 0 var(--orange-shadow);
+    }
+    .error-msg {
+      color: var(--led-red);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      margin-top: 12px;
+      text-align: center;
+      min-height: 16px;
+    }
+  </style>
+</head>
+<body>
+  <div class="login-chassis">
+    <div class="header">
+      <div class="brand">
+        <span style="color:var(--orange);">●</span> ZGATE SYSTEM
+      </div>
+      <span class="badge">AUTH_REQUIRED</span>
+    </div>
+    <form id="loginForm" onsubmit="handleLogin(event)">
+      <label style="display:block; font-size:11px; font-family:var(--font-mono); color:var(--text-dim); margin-bottom:8px;">MASTER ADMIN PASSWORD</label>
+      <input type="password" id="adminKey" class="input" placeholder="Enter GATEWAY_ADMIN_KEY..." required autofocus />
+      <button type="submit" class="btn">AUTHENTICATE CHASSIS</button>
+      <div id="errMsg" class="error-msg"></div>
+    </form>
+  </div>
+  <script>
+    async function handleLogin(e) {
+      e.preventDefault();
+      const key = document.getElementById('adminKey').value.trim();
+      const errEl = document.getElementById('errMsg');
+      errEl.textContent = '';
+      try {
+        const res = await fetch('/api/dashboard/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ key })
+        });
+        const data = await res.json();
+        if (data.ok) {
+          window.location.reload();
+        } else {
+          errEl.textContent = 'ACCESS DENIED // INVALID KEY';
+        }
+      } catch (err) {
+        errEl.textContent = 'COMMUNICATION ERROR';
+      }
+    }
+  </script>
+</body>
+</html>`
+
 func handleDashboardUI(w http.ResponseWriter, r *http.Request) {
+	adminKey := resolveAdminKey()
+	// Server-side enforcement: if GATEWAY_ADMIN_KEY is configured and session is unauthorized,
+	// never send the dashboard HTML payload. Send dedicated login page only.
+	if adminKey != "" && !isDashboardAuthorized(r) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(loginPageHTML))
+		return
+	}
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(dashboardHTML)
 }
