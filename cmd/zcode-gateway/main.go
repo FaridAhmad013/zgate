@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"net"
@@ -188,6 +189,10 @@ func resolveBridgeToken() string {
 	if tok := strings.TrimSpace(os.Getenv("ZCODE_BRIDGE_TOKEN")); tok != "" {
 		return tok
 	}
+	// If explicit empty ZCODE_BRIDGE_TOKEN is provided on public bind, do not auto-generate
+	if _, explicitlySet := os.LookupEnv("ZCODE_BRIDGE_TOKEN"); explicitlySet && !server.IsLoopbackHost(server.ResolveBindHost()) {
+		return ""
+	}
 	// systemd-creds support (ADR 0001): LoadCredential / LoadCredentialEncrypted
 	if credDir := strings.TrimSpace(os.Getenv("CREDENTIALS_DIRECTORY")); credDir != "" {
 		if raw, err := os.ReadFile(filepath.Join(credDir, "bridge_token")); err == nil {
@@ -196,7 +201,21 @@ func resolveBridgeToken() string {
 			}
 		}
 	}
-	return ""
+	// Check persistent token file in accounts directory
+	tokenFile := filepath.Join(filepath.Dir(accounts.AccountsFile()), "bridge_token.txt")
+	if raw, err := os.ReadFile(tokenFile); err == nil {
+		if tok := strings.TrimSpace(string(raw)); tok != "" {
+			return tok
+		}
+	}
+	// Auto-generate standard format API key: sk-zgate-<32 hex chars>
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		tok := fmt.Sprintf("sk-zgate-%x", b[:])
+		_ = os.WriteFile(tokenFile, []byte(tok), 0600)
+		return tok
+	}
+	return "sk-zgate-local-master-token"
 }
 
 func serve() {

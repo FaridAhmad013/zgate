@@ -883,7 +883,7 @@
                 <div class="field-group" style="margin-bottom:14px;">
                   <div class="field-key">BRIDGE_TOKEN</div>
                   <div class="field-val">
-                    <input type="password" id="bridgeTokenField" class="token-field" readonly value="dummy-key">
+                    <input type="password" id="bridgeTokenField" class="token-field" readonly value="Loading...">
                     <div style="display:flex; gap:6px;">
                       <button class="btn-mini" onclick="toggleTokenVisibility()">VIEW</button>
                       <button class="btn-mini" onclick="copyBridgeTokenOnly()">COPY</button>
@@ -1033,7 +1033,7 @@
 
       <div id="loginStep2" style="display:none; text-align:center; margin-top:14px;">
         <a id="loginAuthUrl" href="#" target="_blank" class="btn" style="width:100%; justify-content:center; margin-bottom:10px; text-decoration:none;">Open Z.ai Approval Page</a>
-        <p style="font-size:11px; font-family:var(--font-mono); color:var(--led-amber);">Waiting for browser authorization...</p>
+        <p id="pollStatusText" style="font-size:11px; font-family:var(--font-mono); color:var(--led-amber);">Waiting for browser authorization...</p>
       </div>
 
       <div style="margin-top:16px; text-align:right;">
@@ -1273,6 +1273,7 @@
         authLink.href = data.authUrl;
 
         if (pollInterval) clearInterval(pollInterval);
+        document.getElementById('pollStatusText').textContent = 'Waiting for browser authorization...';
         pollInterval = setInterval(async () => {
           try {
             const pollRes = await fetch('/api/dashboard/login/poll?flowId=' + encodeURIComponent(data.flowId) + '&label=' + encodeURIComponent(label));
@@ -1282,15 +1283,18 @@
               closeLoginModal();
               showToast('ACCOUNT ADDED SUCCESSFULLY');
               loadDashboard();
+            } else if (pollData.status === 'pending') {
+              document.getElementById('pollStatusText').textContent = 'Waiting for approval (browser opened)...';
             } else if (pollData.status === 'failed') {
               clearInterval(pollInterval);
-              showToast('LOGIN FAILED');
-              closeLoginModal();
+              document.getElementById('pollStatusText').textContent = 'Login rejected or expired';
+              showToast('LOGIN FAILED: ' + (pollData.error || 'rejected'));
+              setTimeout(closeLoginModal, 2000);
             }
           } catch (e) {
             console.error('Polling error:', e);
           }
-        }, 2500);
+        }, 2000);
       } catch (networkErr) {
         showToast('GATEWAY OFFLINE');
       }

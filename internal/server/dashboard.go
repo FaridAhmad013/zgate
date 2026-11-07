@@ -297,20 +297,20 @@ func handleDashboardLoginPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pollCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	pollCtx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
 
-	result, err := auth.PollDeviceFlow(pollCtx, entry.flow)
+	result, ready, err := auth.PollOnce(pollCtx, entry.flow)
 	if err != nil {
 		errMsg := err.Error()
 		if errMsg == "" {
 			errMsg = fmt.Sprintf("%v", err)
 		}
-		if strings.Contains(strings.ToLower(errMsg), "context deadline") || strings.Contains(strings.ToLower(errMsg), "waiting") {
-			sendJSON(w, http.StatusOK, map[string]any{"status": "pending"})
-			return
-		}
 		sendJSON(w, http.StatusOK, map[string]any{"status": "failed", "error": errMsg})
+		return
+	}
+	if !ready || result == nil {
+		sendJSON(w, http.StatusOK, map[string]any{"status": "pending"})
 		return
 	}
 
