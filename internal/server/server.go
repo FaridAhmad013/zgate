@@ -399,9 +399,12 @@ func SessionKeyFor(r *http.Request, body map[string]any) string {
 		}
 	}
 
-	var sysAnchor strings.Builder
+	var stackBuf [512]byte
+	buf := stackBuf[:0]
+	hasSys := false
 	if topSys := canonicalContentString(body["system"]); topSys != "" {
-		sysAnchor.WriteString(topSys)
+		buf = append(buf, topSys...)
+		hasSys = true
 	}
 	msgs, _ := body["messages"].([]any)
 	firstUser := ""
@@ -414,10 +417,11 @@ func SessionKeyFor(r *http.Request, body map[string]any) string {
 		switch role {
 		case "system", "developer":
 			if s := canonicalContentString(mm["content"]); s != "" {
-				if sysAnchor.Len() > 0 {
-					sysAnchor.WriteByte('\n')
+				if hasSys {
+					buf = append(buf, '\n')
 				}
-				sysAnchor.WriteString(s)
+				buf = append(buf, s...)
+				hasSys = true
 			}
 		case "user":
 			if firstUser == "" {
@@ -425,15 +429,16 @@ func SessionKeyFor(r *http.Request, body map[string]any) string {
 			}
 		}
 	}
-	if sysAnchor.Len() == 0 && firstUser == "" {
+	if !hasSys && firstUser == "" {
 		return ""
 	}
-	h := sha256.New()
-	h.Write([]byte(sysAnchor.String()))
-	h.Write([]byte{0})
-	h.Write([]byte(firstUser))
-	sum := h.Sum(nil)
-	return "anon:" + hex.EncodeToString(sum[:16])
+	buf = append(buf, 0)
+	buf = append(buf, firstUser...)
+	sum := sha256.Sum256(buf)
+	var out [37]byte
+	copy(out[:5], "anon:")
+	hex.Encode(out[5:], sum[:16])
+	return string(out[:])
 }
 
 func canonicalContentString(v any) string {

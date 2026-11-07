@@ -250,21 +250,27 @@ func Candidates(jwt, accountID string) ([]candidate, error) {
 // canonical identity system blocks with the client's own system prompt
 // riding block 3, session metadata, and sane sampling defaults.
 func ShapePlanBody(body map[string]any, sessionID, deviceID, accountUUID string) (map[string]any, error) {
-	raw, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
+	if body == nil {
+		return nil, errors.New("nil request body")
 	}
-	var out map[string]any
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, err
+	out := make(map[string]any, len(body)+4)
+	for k, v := range body {
+		out[k] = v
 	}
 	out["system"] = systemprompt.BuildSystem(body["system"])
-	meta, _ := out["metadata"].(map[string]any)
-	if meta == nil {
-		meta = map[string]any{}
+
+	var meta map[string]any
+	if origMeta, ok := body["metadata"].(map[string]any); ok && len(origMeta) > 0 {
+		meta = make(map[string]any, len(origMeta)+1)
+		for k, v := range origMeta {
+			meta[k] = v
+		}
+	} else {
+		meta = make(map[string]any, 1)
 	}
 	meta["user_id"] = systemprompt.MetadataUserID(deviceID, sessionID, accountUUID)
 	out["metadata"] = meta
+
 	if out["max_tokens"] == nil {
 		out["max_tokens"] = 8192
 	}
@@ -773,13 +779,18 @@ type SSEEvent struct {
 	Data  string
 }
 
+var (
+	sseFieldEvent = []byte("event")
+	sseFieldData  = []byte("data")
+)
+
 // SSEReader parses an SSE stream across arbitrary chunk boundaries,
 // supporting LF, CRLF, and CR line endings, multiline data fields, and a hard
 // per-event buffer bound.
 type SSEReader struct {
 	r             io.Reader
 	maxEventBytes int
-	readBuf       [16 << 10]byte
+	readBuf       [4 << 10]byte
 	pos           int
 	end           int
 	pendingCR     bool
@@ -850,15 +861,14 @@ func (s *SSEReader) consumeLine(line []byte) error {
 	if hasColon && len(val) > 0 && val[0] == ' ' {
 		val = val[1:]
 	}
-	switch string(field) {
-	case "event":
-		s.eventType = strings.TrimSpace(string(val))
-	case "data":
+	if bytes.Equal(field, sseFieldData) {
 		if s.hasData {
 			s.dataBuf.WriteByte('\n')
 		}
 		s.dataBuf.Write(val)
 		s.hasData = true
+	} else if bytes.Equal(field, sseFieldEvent) {
+		s.eventType = string(bytes.TrimSpace(val))
 	}
 	return nil
 }
@@ -869,8 +879,7 @@ func (s *SSEReader) readLine() ([]byte, bool, error) {
 		if s.pos >= s.end {
 			if s.eof {
 				if s.lineBuf.Len() > 0 {
-					out := append([]byte(nil), s.lineBuf.Bytes()...)
-					s.lineBuf.Reset()
+					out := s.lineBuf.Bytes()
 					return out, true, nil
 				}
 				return nil, false, io.EOF
@@ -879,8 +888,7 @@ func (s *SSEReader) readLine() ([]byte, bool, error) {
 				err := s.readErr
 				s.readErr = nil
 				if s.lineBuf.Len() > 0 {
-					out := append([]byte(nil), s.lineBuf.Bytes()...)
-					s.lineBuf.Reset()
+					out := s.lineBuf.Bytes()
 					return out, true, err
 				}
 				return nil, false, err
@@ -900,28 +908,46 @@ func (s *SSEReader) readLine() ([]byte, bool, error) {
 			}
 		}
 
-		b := s.readBuf[s.pos]
-		s.pos++
 		if s.pendingCR {
 			s.pendingCR = false
-			if b == '\n' {
-				continue
+			if s.readBuf[s.pos] == '\n' {
+				s.pos++
+				if s.pos >= s.end {
+					continue
+				}
 			}
 		}
-		if b == '\r' {
-			s.pendingCR = true
-			out := append([]byte(nil), s.lineBuf.Bytes()...)
-			s.lineBuf.Reset()
-			return out, true, nil
+
+		rem := s.readBuf[s.pos:s.end]
+		eol := -1
+		var delim byte
+		for i := 0; i < len(rem); i++ {
+			if rem[i] == '\n' || rem[i] == '\r' {
+				eol = i
+				delim = rem[i]
+				break
+			}
 		}
-		if b == '\n' {
-			out := append([]byte(nil), s.lineBuf.Bytes()...)
-			s.lineBuf.Reset()
-			return out, true, nil
+
+		if eol >= 0 {
+			if s.lineBuf.Len()+eol+s.eventBytes > s.maxEventBytes {
+				return nil, false, ErrSSEEventTooLarge
+			}
+			s.pos += eol + 1
+			if delim == '\r' {
+				s.pendingCR = true
+			}
+			if s.lineBuf.Len() == 0 {
+				return rem[:eol], true, nil
+			}
+			s.lineBuf.Write(rem[:eol])
+			return s.lineBuf.Bytes(), true, nil
 		}
-		if s.lineBuf.Len()+s.eventBytes+1 > s.maxEventBytes {
+
+		if s.lineBuf.Len()+len(rem)+s.eventBytes > s.maxEventBytes {
 			return nil, false, ErrSSEEventTooLarge
 		}
-		s.lineBuf.WriteByte(b)
+		s.lineBuf.Write(rem)
+		s.pos = s.end
 	}
 }

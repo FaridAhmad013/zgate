@@ -159,12 +159,8 @@ func rateLimitConfig() (rps float64, burst int) {
 // isTrustedProxy checks whether remoteIP matches an explicit entry (IP or CIDR)
 // in ZCODE_TRUSTED_PROXIES. When ZCODE_TRUSTED_PROXIES is empty, no proxy is
 // trusted and X-Forwarded-For / X-Real-IP are ignored.
-func isTrustedProxy(remoteIP net.IP) bool {
-	if remoteIP == nil {
-		return false
-	}
-	raw := strings.TrimSpace(os.Getenv("ZCODE_TRUSTED_PROXIES"))
-	if raw == "" {
+func isTrustedProxyList(remoteIP net.IP, raw string) bool {
+	if remoteIP == nil || raw == "" {
 		return false
 	}
 	for _, item := range strings.Split(raw, ",") {
@@ -195,11 +191,18 @@ func resolveClientIP(r *http.Request) string {
 		host = h
 	}
 	host = strings.Trim(host, "[]")
+	if host == "" {
+		return "unknown"
+	}
+	trustedRaw := strings.TrimSpace(os.Getenv("ZCODE_TRUSTED_PROXIES"))
+	if trustedRaw == "" {
+		return host
+	}
 	remoteIP := net.ParseIP(host)
 	if remoteIP == nil {
 		return "unknown"
 	}
-	if !isTrustedProxy(remoteIP) {
+	if !isTrustedProxyList(remoteIP, trustedRaw) {
 		return remoteIP.String()
 	}
 
@@ -214,7 +217,7 @@ func resolveClientIP(r *http.Request) string {
 			if ip == nil {
 				continue
 			}
-			if !isTrustedProxy(ip) {
+			if !isTrustedProxyList(ip, trustedRaw) {
 				return ip.String()
 			}
 		}

@@ -129,14 +129,20 @@ func SessionIDFor(key, seed string) string {
 	return "session_" + hex.EncodeToString(mac.Sum(nil))[:32]
 }
 
+type metadataUserIDPayload struct {
+	AccountUUID string `json:"account_uuid"`
+	DeviceID    string `json:"device_id"`
+	SessionID   string `json:"session_id"`
+}
+
 // MetadataUserID builds Anthropic metadata.user_id — a JSON string in the
 // client: {"device_id","account_uuid","session_id"}. The gateway reads the
 // device id for attribution; keep it a UUID like the real one.
 func MetadataUserID(deviceID, sessionID, accountUUID string) string {
-	b, _ := json.Marshal(map[string]string{
-		"device_id":    deviceID,
-		"account_uuid": accountUUID,
-		"session_id":   sessionID,
+	b, _ := json.Marshal(metadataUserIDPayload{
+		AccountUUID: accountUUID,
+		DeviceID:    deviceID,
+		SessionID:   sessionID,
 	})
 	return string(b)
 }

@@ -19,18 +19,20 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 )
 
-var asciiPrintable = regexp.MustCompile(`^[\x20-\x7e]+$`)
-
 // Printable gates a raw value: trimmed, non-empty, printable ASCII — else "".
 func Printable(raw string) string {
 	v := strings.TrimSpace(raw)
-	if v == "" || !asciiPrintable.MatchString(v) {
+	if v == "" {
 		return ""
+	}
+	for i := 0; i < len(v); i++ {
+		if v[i] < 0x20 || v[i] > 0x7e {
+			return ""
+		}
 	}
 	return v
 }

@@ -90,6 +90,8 @@ var (
 	inflightRefresh = map[string]*refreshCall{}
 	lastGoodStore   *store
 	lastGoodPath    string
+	lastGoodModTime time.Time
+	lastGoodSize    int64
 	lastStoreErr    error
 	renameFile      = os.Rename
 )
@@ -176,10 +178,18 @@ func backupCorruptFile(path string, raw []byte) (string, error) {
 // (alongside any previously cached in-memory accounts for read-only callers).
 func loadStore() (store, error) {
 	path := AccountsFile()
+	info, statErr := os.Stat(path)
+	if statErr == nil && lastGoodStore != nil && lastGoodPath == path && lastStoreErr == nil &&
+		!lastGoodModTime.IsZero() && info.ModTime().Equal(lastGoodModTime) && info.Size() == lastGoodSize {
+		return cloneStore(*lastGoodStore), nil
+	}
+
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			lastStoreErr = nil
+			lastGoodModTime = time.Time{}
+			lastGoodSize = 0
 			empty := store{Version: 1, Accounts: []Account{}}
 			return empty, nil
 		}
@@ -196,8 +206,9 @@ func loadStore() (store, error) {
 		if backupPath != "" {
 			lastStoreErr = fmt.Errorf("%w: %s (backup saved to %s)", ErrCorruptStore, path, backupPath)
 		} else {
-			lastStoreErr = fmt.Errorf("%w: %s", ErrCorruptStore, path)
+			lastStoreErr = fmt.Errorf("%w: %w", ErrCorruptStore, errors.New(path))
 		}
+		lastGoodModTime = time.Time{}
 		if lastGoodStore != nil && lastGoodPath == path {
 			return cloneStore(*lastGoodStore), lastStoreErr
 		}
@@ -210,6 +221,13 @@ func loadStore() (store, error) {
 	cp := cloneStore(rec)
 	lastGoodStore = &cp
 	lastGoodPath = path
+	if statErr == nil {
+		lastGoodModTime = info.ModTime()
+		lastGoodSize = info.Size()
+	} else if st, err := os.Stat(path); err == nil {
+		lastGoodModTime = st.ModTime()
+		lastGoodSize = st.Size()
+	}
 	lastStoreErr = nil
 	return rec, nil
 }
@@ -272,8 +290,12 @@ func writeStore(rec store) error {
 		lastStoreErr = err
 		return err
 	}
-	if info, err := os.Stat(path); err == nil && info.Mode().Perm() != 0o600 {
-		_ = os.Chmod(path, 0o600)
+	if info, err := os.Stat(path); err == nil {
+		if info.Mode().Perm() != 0o600 {
+			_ = os.Chmod(path, 0o600)
+		}
+		lastGoodModTime = info.ModTime()
+		lastGoodSize = info.Size()
 	}
 	cp := cloneStore(rec)
 	lastGoodStore = &cp
