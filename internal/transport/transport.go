@@ -33,11 +33,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apissaj/zcode-gateway/internal/accounts"
@@ -309,6 +311,28 @@ func WithLane(ctx context.Context, fn func() error) error {
 	}
 }
 
+// ErrStreamIdleTimeout is returned when an active stream receives no data
+// for longer than the configured idle timeout.
+var ErrStreamIdleTimeout = errors.New("upstream stream idle timeout")
+
+var sharedTransport = &http.Transport{
+	Proxy:                 http.ProxyFromEnvironment,
+	DialContext:           (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+	ForceAttemptHTTP2:     true,
+	MaxIdleConns:          100,
+	MaxIdleConnsPerHost:   20,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+}
+
+var sharedClient = &http.Client{
+	Transport: sharedTransport,
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
 // SendOpts carries one upstream call's parameters.
 type SendOpts struct {
 	Body            map[string]any // Anthropic-format request
@@ -317,7 +341,39 @@ type SendOpts struct {
 	ClientSessionID string         // conversation affinity key
 	Context         context.Context
 	HTTP            *http.Client
-	UpstreamTimeout time.Duration // hard deadline (0: 5m)
+	UpstreamTimeout time.Duration // response header deadline (0: 2m or ZCODE_HEADER_TIMEOUT_MS / ZCODE_UPSTREAM_TIMEOUT_MS)
+	IdleTimeout     time.Duration // per-read stream inactivity deadline (0: 2m or ZCODE_STREAM_IDLE_TIMEOUT_MS / ZCODE_UPSTREAM_TIMEOUT_MS)
+}
+
+func resolveHeaderTimeout(o SendOpts) time.Duration {
+	if o.UpstreamTimeout > 0 {
+		return o.UpstreamTimeout
+	}
+	for _, key := range []string{"ZCODE_HEADER_TIMEOUT_MS", "ZCODE_UPSTREAM_TIMEOUT_MS"} {
+		if v := strings.TrimSpace(osGetenv(key)); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				return time.Duration(n) * time.Millisecond
+			}
+		}
+	}
+	return 2 * time.Minute
+}
+
+func resolveIdleTimeout(o SendOpts) time.Duration {
+	if o.IdleTimeout > 0 {
+		return o.IdleTimeout
+	}
+	for _, key := range []string{"ZCODE_STREAM_IDLE_TIMEOUT_MS", "ZCODE_UPSTREAM_TIMEOUT_MS"} {
+		if v := strings.TrimSpace(osGetenv(key)); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				return time.Duration(n) * time.Millisecond
+			}
+		}
+	}
+	if o.UpstreamTimeout > 0 {
+		return o.UpstreamTimeout
+	}
+	return 2 * time.Minute
 }
 
 // SendAnthropic sends one Anthropic-shaped request to the plan endpoint
@@ -336,26 +392,11 @@ func SendAnthropic(o SendOpts) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	timeout := o.UpstreamTimeout
-	if timeout <= 0 {
-		// ZCODE_UPSTREAM_TIMEOUT_MS hard-deadline override; default 5m.
-		if v := osGetenv("ZCODE_UPSTREAM_TIMEOUT_MS"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n > 0 {
-				timeout = time.Duration(n) * time.Millisecond
-			}
-		}
-		if timeout <= 0 {
-			timeout = 5 * time.Minute
-		}
-	}
+	headerTimeout := resolveHeaderTimeout(o)
+	idleTimeout := resolveIdleTimeout(o)
 	client := o.HTTP
 	if client == nil {
-		client = &http.Client{
-			Timeout: timeout,
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		}
+		client = sharedClient
 	}
 
 	var lastErr *UpstreamError
@@ -381,7 +422,7 @@ func SendAnthropic(o SendOpts) (*http.Response, error) {
 			break
 		}
 		hasMoreAccounts := remaining > 0
-		res, err := runAccount(ctx, client, *acct, o, timeout, hasMoreAccounts)
+		res, err := runAccount(ctx, client, *acct, o, headerTimeout, idleTimeout, hasMoreAccounts)
 		if err == nil {
 			if acct.ID != "" {
 				accounts.ClearCooldown(acct.ID)
@@ -424,7 +465,7 @@ func SendAnthropic(o SendOpts) (*http.Response, error) {
 
 // runAccount runs one account's turn: transient retries in place, one
 // singleflight refresh on 401, then a switchable error => throw for rotation.
-func runAccount(ctx context.Context, client *http.Client, acct candidate, o SendOpts, timeout time.Duration, hasMoreAccounts bool) (*http.Response, error) {
+func runAccount(ctx context.Context, client *http.Client, acct candidate, o SendOpts, headerTimeout, idleTimeout time.Duration, hasMoreAccounts bool) (*http.Response, error) {
 	maxAttempts := 3
 	if v := osGetenv("ZCODE_MAX_ATTEMPTS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -441,7 +482,7 @@ func runAccount(ctx context.Context, client *http.Client, acct candidate, o Send
 	refreshed := false
 	var lastErr *UpstreamError
 	for n := 0; n < maxAttempts; n++ {
-		res, attemptErr := attemptOnce(ctx, client, acct, bearer, o, timeout)
+		res, attemptErr := attemptOnce(ctx, client, acct, bearer, o, headerTimeout, idleTimeout)
 		if res != nil && res.StatusCode >= 200 && res.StatusCode < 300 {
 			return res, nil
 		}
@@ -511,8 +552,10 @@ func runAccount(ctx context.Context, client *http.Client, acct candidate, o Send
 	return nil, lastErr
 }
 
-// attemptOnce performs one upstream POST.
-func attemptOnce(ctx context.Context, client *http.Client, acct candidate, bearer string, o SendOpts, timeout time.Duration) (*http.Response, error) {
+// attemptOnce performs one upstream POST with a response-header deadline and
+// an activity-based stream idle timeout (so long active streams are never cut
+// short by a fixed wall-clock timeout).
+func attemptOnce(ctx context.Context, client *http.Client, acct candidate, bearer string, o SendOpts, headerTimeout, idleTimeout time.Duration) (*http.Response, error) {
 	deviceID := firstNonEmpty(acct.DeviceID, identity.ResolveDeviceMid(), newUUID())
 	sessionID := systemprompt.SessionIDFor(o.ClientSessionID, acct.SessionSeed)
 	requestID := newUUID()
@@ -543,13 +586,7 @@ func attemptOnce(ctx context.Context, client *http.Client, acct candidate, beare
 		return nil, &UpstreamError{Msg: "invalid inference origin: " + err.Error(), Status: 500, Kind: "config"}
 	}
 
-	// The lane is a process-wide queue, so one hung upstream socket would
-	// stall every later request behind it. Race a hard deadline against the
-	// caller's context (AbortSignal.any equivalent).
-	callCtx, cancel := context.WithTimeout(ctx, timeout)
-	// NO deferred cancel: the response body keeps streaming after this
-	// function returns, and canceling here would kill it mid-flight. The
-	// returned body is wrapped so cancel runs when the consumer closes it.
+	callCtx, cancel := context.WithCancel(ctx)
 	req, err := http.NewRequestWithContext(callCtx, http.MethodPost, baseOrigin+PlanAnthropicPath, bytes.NewReader(raw))
 	if err != nil {
 		cancel()
@@ -558,28 +595,107 @@ func attemptOnce(ctx context.Context, client *http.Client, acct candidate, beare
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
+
+	var hdrTimedOut atomic.Bool
+	var hdrTimer *time.Timer
+	if headerTimeout > 0 {
+		hdrTimer = time.AfterFunc(headerTimeout, func() {
+			hdrTimedOut.Store(true)
+			cancel()
+		})
+	}
 	resp, err := client.Do(req)
+	if hdrTimer != nil {
+		hdrTimer.Stop()
+	}
 	if err != nil {
 		cancel()
-		if callCtx.Err() != nil && ctx.Err() == nil {
+		if (hdrTimedOut.Load() || callCtx.Err() != nil) && ctx.Err() == nil {
 			return nil, &UpstreamError{Msg: "upstream timeout", Status: 504, Kind: "upstream"}
 		}
 		return nil, &UpstreamError{Msg: "upstream fetch failed: " + auth.RedactSecrets(err.Error(), bearer), Status: 502, Kind: "upstream"}
 	}
-	resp.Body = &cancelBody{ReadCloser: resp.Body, cancel: cancel}
+	resp.Body = &cancelBody{
+		ReadCloser:  resp.Body,
+		parentCtx:   ctx,
+		cancel:      cancel,
+		idleTimeout: idleTimeout,
+	}
 	return resp, nil
 }
 
-// cancelBody runs the request cancel when the consumer closes the body —
-// the Go equivalent of letting the fetch signal live until the stream ends.
+// cancelBody runs the request cancel when the consumer closes the body and
+// enforces a per-Read inactivity timeout without limiting total stream duration.
 type cancelBody struct {
 	io.ReadCloser
-	cancel context.CancelFunc
-	once   sync.Once
+	parentCtx   context.Context
+	cancel      context.CancelFunc
+	idleTimeout time.Duration
+	release     func()
+
+	timerMu  sync.Mutex
+	timer    *time.Timer
+	closed   bool
+	timedOut atomic.Bool
+	once     sync.Once
+}
+
+func (b *cancelBody) Read(p []byte) (int, error) {
+	if b.idleTimeout > 0 {
+		if !b.armIdleTimer() {
+			return 0, io.EOF
+		}
+		defer b.disarmIdleTimer()
+	}
+	n, err := b.ReadCloser.Read(p)
+	if err != nil && b.timedOut.Load() && (b.parentCtx == nil || b.parentCtx.Err() == nil) {
+		return n, ErrStreamIdleTimeout
+	}
+	return n, err
+}
+
+func (b *cancelBody) armIdleTimer() bool {
+	b.timerMu.Lock()
+	defer b.timerMu.Unlock()
+	if b.closed {
+		return false
+	}
+	if b.timer == nil {
+		b.timer = time.AfterFunc(b.idleTimeout, func() {
+			b.timedOut.Store(true)
+			if b.cancel != nil {
+				b.cancel()
+			}
+		})
+	} else {
+		b.timer.Reset(b.idleTimeout)
+	}
+	return true
+}
+
+func (b *cancelBody) disarmIdleTimer() {
+	b.timerMu.Lock()
+	defer b.timerMu.Unlock()
+	if b.timer != nil {
+		b.timer.Stop()
+	}
 }
 
 func (b *cancelBody) Close() error {
-	b.once.Do(b.cancel)
+	b.once.Do(func() {
+		b.timerMu.Lock()
+		b.closed = true
+		if b.timer != nil {
+			b.timer.Stop()
+		}
+		b.timerMu.Unlock()
+		if b.cancel != nil {
+			b.cancel()
+		}
+		if b.release != nil {
+			b.release()
+		}
+	})
 	return b.ReadCloser.Close()
 }
 

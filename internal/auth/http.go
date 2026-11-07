@@ -38,17 +38,18 @@ func newRequest(ctx context.Context, method, url string, body io.Reader, headers
 	return req, nil
 }
 
+var authHTTPClient = &http.Client{
+	Timeout: 30 * time.Second,
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
 // doRequest performs one HTTP round-trip with a hard timeout and returns the
 // raw body + status. Redirects are not followed so bearer/poll/refresh tokens
 // are never forwarded to another origin or internal host.
 func doRequest(req *http.Request) ([]byte, int, error) {
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-	resp, err := client.Do(req)
+	resp, err := authHTTPClient.Do(req)
 	if err != nil {
 		return nil, 0, err
 	}

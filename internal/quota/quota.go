@@ -89,6 +89,13 @@ type envelope struct {
 	Status int
 }
 
+var quotaHTTPClient = &http.Client{
+	Timeout: 20 * time.Second,
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
 func fetchEnvelope(ctx context.Context, path string, headers map[string]string) envelope {
 	baseOrigin, err := auth.ValidateOriginURL(identity.Origin())
 	if err != nil {
@@ -101,13 +108,7 @@ func fetchEnvelope(ctx context.Context, path string, headers map[string]string) 
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	client := &http.Client{
-		Timeout: 20 * time.Second,
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-	res, err := client.Do(req)
+	res, err := quotaHTTPClient.Do(req)
 	if err != nil {
 		return envelope{Msg: wrap(err)}
 	}
