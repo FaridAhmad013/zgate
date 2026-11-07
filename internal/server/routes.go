@@ -369,6 +369,8 @@ func route(origW http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && (pathName == "/" || pathName == "/dashboard"):
 		handleDashboardUI(w, r)
+	case r.Method == http.MethodGet && (pathName == "/favicon.ico" || pathName == "/favicon.svg"):
+		handleFavicon(w, r)
 	case r.Method == http.MethodGet && pathName == "/api/dashboard/auth/verify":
 		handleDashboardAuthVerify(w, r)
 	case r.Method == http.MethodPost && pathName == "/api/dashboard/auth/login":

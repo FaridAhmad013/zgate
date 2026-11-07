@@ -271,7 +271,7 @@ func handleDashboardUI(w http.ResponseWriter, r *http.Request) {
 	if adminKey != "" && !isDashboardAuthorized(r) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
-		w.WriteHeader(http.StatusUnauthorized)
+		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(loginPageHTML))
 		return
 	}
@@ -280,6 +280,19 @@ func handleDashboardUI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(dashboardHTML)
+}
+
+const faviconSVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <rect width="32" height="32" rx="6" fill="#141413"/>
+  <rect x="2" y="2" width="28" height="28" rx="4" fill="#1b1b19" stroke="#ff5500" stroke-width="2"/>
+  <text x="50%" y="54%" dominant-baseline="middle" text-anchor="middle" fill="#ff5500" font-family="monospace" font-weight="900" font-size="18">Z</text>
+</svg>`
+
+func handleFavicon(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "image/svg+xml")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(faviconSVG))
 }
 
 func handleDashboardAuthVerify(w http.ResponseWriter, r *http.Request) {
