@@ -181,7 +181,26 @@ func anthropicError(w http.ResponseWriter, status int, message, typ string) {
 }
 
 func openAIError(w http.ResponseWriter, status int, message string, code any) {
-	sendJSON(w, status, map[string]any{"error": map[string]any{"message": redactMsg(message), "type": "invalid_request_error", "code": code}})
+	typ := "invalid_request_error"
+	if status == http.StatusUnauthorized {
+		typ = "authentication_error"
+	} else if status == http.StatusForbidden {
+		typ = "permission_error"
+	} else if status == http.StatusNotFound {
+		typ = "not_found_error"
+	} else if status == http.StatusTooManyRequests {
+		typ = "rate_limit_error"
+	} else if status >= 500 {
+		typ = "api_error"
+	}
+	openAIErrorWithType(w, status, message, typ, code)
+}
+
+func openAIErrorWithType(w http.ResponseWriter, status int, message, typ string, code any) {
+	if typ == "" {
+		typ = "api_error"
+	}
+	sendJSON(w, status, map[string]any{"error": map[string]any{"message": redactMsg(message), "type": typ, "code": code}})
 }
 
 func constantTimeTokenEqual(presented, expected string) bool {
@@ -329,10 +348,13 @@ func extractJSONField(s, field string) string {
 	return rest[:k]
 }
 
-// relayUpstreamError copies an upstream error into the caller's dialect.
+// relayUpstreamError maps an upstream error into the caller's dialect.
+// Provider authentication failures (401/403 from Z.ai) are mapped to 502 Bad
+// Gateway so clients and routers never mistake an expired upstream ZCode JWT
+// for an invalid local ZCODE_BRIDGE_TOKEN.
 func relayUpstreamError(w http.ResponseWriter, err error, dialect string) {
 	message := err.Error()
-	status := 502
+	status := http.StatusBadGateway
 	var code any
 	if ue, ok := err.(*transport.UpstreamError); ok {
 		if ue.Status > 0 {
@@ -340,15 +362,40 @@ func relayUpstreamError(w http.ResponseWriter, err error, dialect string) {
 		}
 		code = ue.Code
 	}
+
+	typ := "api_error"
+	switch {
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		status = http.StatusBadGateway
+		typ = "upstream_authentication_error"
+		message = "upstream provider authentication failed (re-run zcode-gateway login): " + message
+	case isCode(code, 1113):
+		if status < 400 {
+			status = http.StatusTooManyRequests
+		}
+		if dialect == "openai" {
+			typ = "insufficient_quota"
+		} else {
+			typ = "rate_limit_error"
+		}
+	case isCode(code, 3008) || isCode(code, 3009) || isCode(code, 3012) || status == http.StatusTooManyRequests:
+		typ = "rate_limit_error"
+	case status == http.StatusGatewayTimeout:
+		typ = "timeout_error"
+	case status >= 400 && status < 500:
+		typ = "invalid_request_error"
+	}
+
 	if dialect == "openai" {
-		openAIError(w, status, message, code)
+		openAIErrorWithType(w, status, message, typ, code)
 		return
 	}
-	typ := "api_error"
-	if f, ok := code.(float64); ok && f == 3012 {
-		typ = "rate_limit_error"
-	}
 	anthropicError(w, status, message, typ)
+}
+
+func isCode(code any, want float64) bool {
+	f, ok := code.(float64)
+	return ok && f == want
 }
 
 // handleMessages serves POST /v1/messages (Anthropic dialect).
@@ -567,10 +614,12 @@ func extractStreamError(event map[string]any) (string, string) {
 	return firstNonEmpty(stringOf(event["message"]), stringOf(event["msg"]), "upstream stream error"), ""
 }
 
-// chunkState tracks Anthropic block indexes -> OpenAI tool_call indexes.
+// chunkState tracks Anthropic block indexes -> OpenAI tool_call indexes and
+// preserves the upstream message ID across all chunks of a stream.
 // Anthropic numbers content blocks globally (thinking=0, tool_use=1...);
 // OpenAI expects tool_calls numbered from 0 within the message.
 type chunkState struct {
+	messageID     string
 	toolByBlock   map[float64]int
 	nextToolIndex int
 }
@@ -578,7 +627,21 @@ type chunkState struct {
 // toOpenAIChunk maps one Anthropic stream event onto an OpenAI
 // chat.completion.chunk. nil = drop the event.
 func toOpenAIChunk(event map[string]any, model string, state *chunkState) map[string]any {
+	typ := stringOf(event["type"])
+	if typ == "message_start" {
+		if msg, ok := event["message"].(map[string]any); ok {
+			if mid := stringOf(msg["id"]); mid != "" && state != nil {
+				state.messageID = mid
+			}
+		}
+	}
 	id := stringOf(event["id"])
+	if id != "" && state != nil && state.messageID == "" {
+		state.messageID = id
+	}
+	if id == "" && state != nil {
+		id = state.messageID
+	}
 	if id == "" {
 		id = "chatcmpl-stream"
 	}
@@ -588,7 +651,6 @@ func toOpenAIChunk(event map[string]any, model string, state *chunkState) map[st
 		"created": time.Now().Unix(),
 		"model":   model,
 	}
-	typ := stringOf(event["type"])
 	switch typ {
 	case "message_start":
 		base["choices"] = []any{map[string]any{"index": 0, "delta": map[string]any{"role": "assistant", "content": ""}, "finish_reason": nil}}

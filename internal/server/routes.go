@@ -26,12 +26,21 @@ func Route() http.Handler {
 	return http.HandlerFunc(route)
 }
 
+func dialectForPath(path string) string {
+	p := strings.TrimRight(path, "/")
+	if strings.HasPrefix(p, "/v1/chat/completions") || p == "/v1/models" || p == "/models" {
+		return "openai"
+	}
+	return "anthropic"
+}
+
 func route(w http.ResponseWriter, r *http.Request) {
+	reqDialect := dialectForPath(r.URL.Path)
 	if !validHostHeader(r, getConfig()) {
-		anthropicError(w, http.StatusForbidden, "Invalid Host header", "forbidden_error")
+		writeDialectError(w, reqDialect, http.StatusForbidden, "Invalid Host header", "forbidden_error")
 		return
 	}
-	if !cors(w, r) {
+	if !cors(w, r, reqDialect) {
 		return // preflight or rejected cross-origin request handled
 	}
 	pathName := strings.TrimRight(r.URL.Path, "/")
@@ -67,7 +76,7 @@ func route(w http.ResponseWriter, r *http.Request) {
 			handlePost(w, r, accountID, "openai", handleChatCompletions)
 		})
 	default:
-		anthropicError(w, http.StatusNotFound, fmt.Sprintf("No route for %s %s", r.Method, r.URL.Path), "not_found_error")
+		writeDialectError(w, reqDialect, http.StatusNotFound, fmt.Sprintf("No route for %s %s", r.Method, r.URL.Path), "not_found_error")
 	}
 }
 
@@ -99,7 +108,7 @@ func isJSONContentType(r *http.Request) bool {
 
 func writeDialectError(w http.ResponseWriter, dialect string, status int, message, typ string) {
 	if dialect == "openai" {
-		openAIError(w, status, message, typ)
+		openAIErrorWithType(w, status, message, typ, typ)
 		return
 	}
 	anthropicError(w, status, message, typ)
@@ -255,20 +264,20 @@ func isAllowedOrigin(origin, rawAllowlist string) bool {
 // via ZCODE_CORS_ORIGIN (explicit comma-separated origin list; wildcards are
 // not accepted). Returns false when the request was handled (preflight or
 // rejected cross-origin request).
-func cors(w http.ResponseWriter, r *http.Request) bool {
+func cors(w http.ResponseWriter, r *http.Request, dialect string) bool {
 	corsOrigins := strings.TrimSpace(os.Getenv("ZCODE_CORS_ORIGIN"))
 	origin := strings.TrimSpace(r.Header.Get("Origin"))
 	secFetchSite := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")))
 
 	if origin != "" {
 		if !isAllowedOrigin(origin, corsOrigins) {
-			anthropicError(w, http.StatusForbidden, "Cross-origin request rejected", "forbidden_error")
+			writeDialectError(w, dialect, http.StatusForbidden, "Cross-origin request rejected", "forbidden_error")
 			return false
 		}
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 		w.Header().Add("Vary", "Origin")
 	} else if secFetchSite != "" && secFetchSite != "none" && secFetchSite != "same-origin" {
-		anthropicError(w, http.StatusForbidden, "Cross-site browser request rejected", "forbidden_error")
+		writeDialectError(w, dialect, http.StatusForbidden, "Cross-site browser request rejected", "forbidden_error")
 		return false
 	}
 
