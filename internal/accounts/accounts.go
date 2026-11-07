@@ -645,7 +645,9 @@ func AcquireCandidate(ctx context.Context, pinnedID string, exclude map[string]b
 		if pinnedID != "" {
 			for _, a := range rec.Accounts {
 				if a.ID == pinnedID && !exclude[a.ID] {
-					cands = []Account{a}
+					if !a.NeedsReauth && !cooledDown(a.ID, time.Now()) {
+						cands = []Account{a}
+					}
 					break
 				}
 			}
@@ -696,6 +698,16 @@ func AcquireCandidate(ctx context.Context, pinnedID string, exclude map[string]b
 		select {
 		case <-waitCh:
 		case <-ctx.Done():
+			// CONC-01 remediation: Remove waitCh from slotWaiters so abandoned
+			// channels do not accumulate when context cancels under load.
+			mu.Lock()
+			for i := 0; i < len(slotWaiters); i++ {
+				if slotWaiters[i] == waitCh {
+					slotWaiters = append(slotWaiters[:i], slotWaiters[i+1:]...)
+					break
+				}
+			}
+			mu.Unlock()
 			return Account{}, 0, nil, ctx.Err()
 		}
 	}

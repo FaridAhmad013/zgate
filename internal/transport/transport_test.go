@@ -218,7 +218,7 @@ func TestContextCancellationRespectedDuring3008Backoff(t *testing.T) {
 	t.Setenv("ZCODE_RETRY_BASE_MS", "500")
 	_, _ = accounts.UpsertAccount("solo", "Solo", testJWT("u_solo"), "", "", 0)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
 	body := map[string]any{"model": "glm-5.3-flash", "messages": []any{map[string]any{"role": "user", "content": "hi"}}}

@@ -253,10 +253,36 @@ func allowRequest(r *http.Request) (bool, int) {
 	rateMu.Lock()
 	defer rateMu.Unlock()
 
+	const maxRateBuckets = 8192
 	if len(rateBuckets) > 4096 {
 		for k, b := range rateBuckets {
 			if now.Sub(b.lastSeen) > 5*time.Minute {
 				delete(rateBuckets, k)
+			}
+		}
+		// SEC-01 remediation: If flood of unique IPs prevents 5-minute expiry,
+		// enforce hard ceiling by pruning oldest entries.
+		if len(rateBuckets) >= maxRateBuckets {
+			type entry struct {
+				key      string
+				lastSeen time.Time
+			}
+			entries := make([]entry, 0, len(rateBuckets))
+			for k, b := range rateBuckets {
+				entries = append(entries, entry{key: k, lastSeen: b.lastSeen})
+			}
+			// Sort ascending by lastSeen to evict oldest first
+			for i := 0; i < len(entries)-1; i++ {
+				for j := i + 1; j < len(entries); j++ {
+					if entries[j].lastSeen.Before(entries[i].lastSeen) {
+						entries[i], entries[j] = entries[j], entries[i]
+					}
+				}
+			}
+			// Evict oldest quarter of the map to free capacity
+			evictCount := len(entries) / 4
+			for i := 0; i < evictCount; i++ {
+				delete(rateBuckets, entries[i].key)
 			}
 		}
 	}
@@ -340,6 +366,24 @@ func route(origW http.ResponseWriter, r *http.Request) {
 	}
 
 	switch {
+	case r.Method == http.MethodGet && (pathName == "/" || pathName == "/dashboard"):
+		handleDashboardUI(w, r)
+	case r.Method == http.MethodGet && pathName == "/api/dashboard/auth/verify":
+		handleDashboardAuthVerify(w, r)
+	case r.Method == http.MethodPost && pathName == "/api/dashboard/auth/login":
+		handleDashboardAuthLogin(w, r)
+	case r.Method == http.MethodPost && pathName == "/api/dashboard/auth/logout":
+		handleDashboardAuthLogout(w, r)
+	case r.Method == http.MethodGet && pathName == "/api/dashboard/status":
+		handleDashboardStatus(w, r)
+	case r.Method == http.MethodPost && pathName == "/api/dashboard/login/start":
+		handleDashboardLoginStart(w, r)
+	case r.Method == http.MethodGet && pathName == "/api/dashboard/login/poll":
+		handleDashboardLoginPoll(w, r)
+	case r.Method == http.MethodPost && pathName == "/api/dashboard/account/default":
+		handleDashboardAccountDefault(w, r)
+	case r.Method == http.MethodPost && pathName == "/api/dashboard/account/remove":
+		handleDashboardAccountRemove(w, r)
 	case r.Method == http.MethodGet && pathName == "/healthz":
 		sendJSON(w, http.StatusOK, map[string]any{"ok": true})
 	case r.Method == http.MethodGet && pathName == "/health":

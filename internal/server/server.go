@@ -340,8 +340,11 @@ func readBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 	case res := <-ch:
 		return res.data, res.err
 	case <-timer.C:
+		// SEC-02 remediation: Close body to unblock background io.ReadAll goroutine
+		_ = body.Close()
 		return nil, errBodyReadTimeout
 	case <-r.Context().Done():
+		_ = body.Close()
 		return nil, r.Context().Err()
 	}
 }
