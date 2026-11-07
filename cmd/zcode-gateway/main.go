@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -201,14 +202,11 @@ func serve() {
 		}
 	}()
 
-	go func() {
-		<-ctx.Done()
-		// Give in-flight streams a moment, then leave.
-		time.Sleep(500 * time.Millisecond)
-		os.Exit(0)
-	}()
-
-	if err := server.ListenAndServe(); err != nil {
+	if err := server.ListenAndServeContext(ctx); err != nil {
+		if ctx.Err() != nil && errors.Is(err, context.DeadlineExceeded) {
+			fmt.Fprintln(os.Stderr, "server: graceful shutdown timeout reached; remaining connections closed")
+			return
+		}
 		fmt.Fprintf(os.Stderr, "server: %s\n", auth.RedactSecrets(err.Error(), cfg.BridgeToken))
 		os.Exit(1)
 	}
