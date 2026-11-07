@@ -17,6 +17,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -225,9 +226,18 @@ func parseJSON(raw []byte) (map[string]any, bool) {
 // SessionKeyFor derives the conversation affinity key. The gateway meters
 // plan usage per session and flags brand-new session churn, so one client
 // conversation must keep one derived session_<32hex> (see
-// systemprompt.SessionIDFor). Sources, in order: OpenAI `user`, Anthropic
-// metadata.user_id (the desktop shape carries session_id inside), a caller
-// x-session-id header, else the first user turn + conversation size.
+// systemprompt.SessionIDFor).
+//
+// Sources, in order:
+//  1. OpenAI `user` field.
+//  2. Anthropic `metadata.user_id` (extracting embedded `session_id` when present).
+//  3. Caller `X-Session-Id` header.
+//  4. Anonymous fallback: SHA-256 digest of the conversation's opening anchor
+//     (system prompt + first user message), excluding message count so the key
+//     remains stable across subsequent turns and never embeds raw prompt text.
+//     Note: two anonymous conversations that start with an identical system
+//     prompt and identical first user turn will share this fallback key unless
+//     the caller supplies `user`, `metadata.user_id`, or `X-Session-Id`.
 func SessionKeyFor(r *http.Request, body map[string]any) string {
 	if u, ok := body["user"].(string); ok && strings.TrimSpace(u) != "" {
 		return strings.TrimSpace(u)
@@ -241,26 +251,61 @@ func SessionKeyFor(r *http.Request, body map[string]any) string {
 			return strings.TrimSpace(uid)
 		}
 	}
-	if inbound := r.Header.Get("X-Session-Id"); strings.TrimSpace(inbound) != "" {
-		return strings.TrimSpace(inbound)
-	}
-	msgs, _ := body["messages"].([]any)
-	first := ""
-	for _, m := range msgs {
-		if mm, ok := m.(map[string]any); ok && mm["role"] == "user" {
-			if c, ok := mm["content"].(string); ok {
-				first = c
-			} else {
-				raw, _ := json.Marshal(mm["content"])
-				first = string(raw)
-			}
-			break
+	if r != nil {
+		if inbound := r.Header.Get("X-Session-Id"); strings.TrimSpace(inbound) != "" {
+			return strings.TrimSpace(inbound)
 		}
 	}
-	if len(first) > 384 {
-		first = first[:384]
+
+	var sysAnchor strings.Builder
+	if topSys := canonicalContentString(body["system"]); topSys != "" {
+		sysAnchor.WriteString(topSys)
 	}
-	return fmt.Sprintf("anon:%s:%d", first, len(msgs))
+	msgs, _ := body["messages"].([]any)
+	firstUser := ""
+	for _, m := range msgs {
+		mm, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := mm["role"].(string)
+		switch role {
+		case "system", "developer":
+			if s := canonicalContentString(mm["content"]); s != "" {
+				if sysAnchor.Len() > 0 {
+					sysAnchor.WriteByte('\n')
+				}
+				sysAnchor.WriteString(s)
+			}
+		case "user":
+			if firstUser == "" {
+				firstUser = canonicalContentString(mm["content"])
+			}
+		}
+	}
+	if sysAnchor.Len() == 0 && firstUser == "" {
+		return ""
+	}
+	h := sha256.New()
+	h.Write([]byte(sysAnchor.String()))
+	h.Write([]byte{0})
+	h.Write([]byte(firstUser))
+	sum := h.Sum(nil)
+	return "anon:" + hex.EncodeToString(sum[:16])
+}
+
+func canonicalContentString(v any) string {
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return strings.TrimSpace(s)
+	}
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return ""
+	}
+	return string(raw)
 }
 
 // extractJSONField pulls one top-level string field out of an embedded JSON
