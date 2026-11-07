@@ -1,0 +1,31 @@
+services:
+  zgate:
+    image: ghcr.io/faridahmad013/zgate:latest
+    container_name: zgate
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "127.0.0.1:20131:20131"
+    environment:
+      - BIND_HOST=0.0.0.0
+      - PORT=20131
+      - ZCODE_BRIDGE_TOKEN=${ZCODE_BRIDGE_TOKEN:-}
+      - GATEWAY_ADMIN_KEY=${GATEWAY_ADMIN_KEY:-}
+      - ZCODE_ALLOWED_HOSTS=${ZCODE_ALLOWED_HOSTS:-zgate.faridahmad.dev,127.0.0.1,localhost}
+      - ZCODE_TRUSTED_PROXIES=127.0.0.1,172.16.0.0/12,192.168.0.0/16
+      - ZCODE_LANE_WIDTH=2
+      - ZCODE_ACCOUNT_CONCURRENCY=1
+      - ZCODE_RATE_LIMIT_RPS=20
+      - ZCODE_RATE_LIMIT_BURST=40
+      - ZCODE_SHUTDOWN_TIMEOUT_MS=15000
+    volumes:
+      - zgate_data:/data
+    stop_signal: SIGTERM
+    stop_grace_period: 20s
+
+volumes:
+  zgate_data:
+    driver: local

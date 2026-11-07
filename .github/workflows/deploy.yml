@@ -1,0 +1,103 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    name: Lint & Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache-dependency-path: go.sum
+
+      - name: Run Gateway Tests
+        run: |
+          go vet ./...
+          go test -count=1 ./...
+          go test -race -count=1 ./internal/server/
+
+  build-and-push:
+    name: Build & Push Docker Image
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Lowercase Repository Name
+        run: |
+          echo "REPO_LOWER=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+
+      - name: Build and Push ZGate Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deployments/docker/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ env.REPO_LOWER }}:latest
+            ghcr.io/${{ env.REPO_LOWER }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to VPS
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Copy docker-compose to VPS
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          passphrase: ${{ secrets.VPS_SSH_PASSPHRASE }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          source: "docker-compose.yml"
+          target: "/home/${{ secrets.VPS_USERNAME }}/zgate"
+
+      - name: Execute Remote Deployment via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          passphrase: ${{ secrets.VPS_SSH_PASSPHRASE }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          envs: GH_TOKEN,ACTOR
+          script: |
+            mkdir -p /home/${{ secrets.VPS_USERNAME }}/zgate
+            cd /home/${{ secrets.VPS_USERNAME }}/zgate
+            echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+            docker compose pull
+            docker compose up -d --remove-orphans
+            docker image prune -f
