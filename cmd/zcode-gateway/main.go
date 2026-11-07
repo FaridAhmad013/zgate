@@ -11,8 +11,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -38,6 +41,10 @@ func envInt(key string, fallback int) int {
 
 func main() {
 	args := os.Args[1:]
+	if len(args) > 0 && args[0] == "healthcheck" {
+		runHealthcheck(args[1:])
+		return
+	}
 	if len(args) > 0 && args[0] == "login" {
 		runLogin(args[1:])
 		return
@@ -156,11 +163,47 @@ func orUnknown(s string) string {
 	return s
 }
 
+func runHealthcheck(args []string) {
+	port := envInt("PORT", 20131)
+	bindHost := server.ResolveBindHost()
+	if bindHost == "0.0.0.0" || bindHost == "::" {
+		bindHost = "127.0.0.1"
+	}
+	url := fmt.Sprintf("http://%s/healthz", net.JoinHostPort(bindHost, strconv.Itoa(port)))
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "healthcheck failed: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "healthcheck failed with HTTP status %d\n", resp.StatusCode)
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+func resolveBridgeToken() string {
+	if tok := strings.TrimSpace(os.Getenv("ZCODE_BRIDGE_TOKEN")); tok != "" {
+		return tok
+	}
+	// systemd-creds support (ADR 0001): LoadCredential / LoadCredentialEncrypted
+	if credDir := strings.TrimSpace(os.Getenv("CREDENTIALS_DIRECTORY")); credDir != "" {
+		if raw, err := os.ReadFile(filepath.Join(credDir, "bridge_token")); err == nil {
+			if tok := strings.TrimSpace(string(raw)); tok != "" {
+				return tok
+			}
+		}
+	}
+	return ""
+}
+
 func serve() {
 	cfg := server.Config{
 		Port:        envInt("PORT", 20131),
 		Host:        server.ResolveBindHost(),
-		BridgeToken: strings.TrimSpace(os.Getenv("ZCODE_BRIDGE_TOKEN")),
+		BridgeToken: resolveBridgeToken(),
 	}
 	if err := server.ValidateConfig(cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "configuration error: %s\n", auth.RedactSecrets(err.Error(), cfg.BridgeToken))
@@ -183,8 +226,22 @@ func serve() {
 	if cfg.BridgeToken != "" {
 		authMode = "bridge token required"
 	}
-	fmt.Printf("zcode-gateway %s listening on %s:%d\n  lane: zcode-plan/anthropic -> %s\n  plan jwt: %s\n  device mid: %s\n  auth: %s\n",
-		version, cfg.Host, cfg.Port, transport.InferenceOrigin+transport.PlanAnthropicPath, jwtState, midState, authMode)
+	dashHost := cfg.Host
+	if dashHost == "0.0.0.0" || dashHost == "::" {
+		dashHost = "127.0.0.1"
+	}
+	dashURL := fmt.Sprintf("http://%s:%d/dashboard", dashHost, cfg.Port)
+	apiURL := fmt.Sprintf("http://%s:%d/v1", dashHost, cfg.Port)
+
+	fmt.Printf("\n  ┌────────────────────────────────────────────────────────┐\n")
+	fmt.Printf("  │ ZGate v%s (Hardened AI Gateway)                    │\n", version)
+	fmt.Printf("  │ Listener       : %s:%d\n", cfg.Host, cfg.Port)
+	fmt.Printf("  │ Web Dashboard  : %s\n", dashURL)
+	fmt.Printf("  │ API Endpoint   : %s\n", apiURL)
+	fmt.Printf("  │ Plan JWT       : %s\n", jwtState)
+	fmt.Printf("  │ Auth Mode      : %s\n", authMode)
+	fmt.Printf("  │ Upstream Lane  : %s\n", transport.InferenceOrigin+transport.PlanAnthropicPath)
+	fmt.Printf("  └────────────────────────────────────────────────────────┘\n\n")
 
 	// Background refresh: check every 15m (ZCODE_REFRESH_INTERVAL_MS),
 	// refresh accounts expiring within 2h.

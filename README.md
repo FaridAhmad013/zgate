@@ -1,144 +1,144 @@
-# zcode-gateway
+# ZGate (ZCode Gateway)
 
-Local OpenAI & Anthropic-compatible gateway for the ZCode Start-Plan (GLM-5.3 & GLM-5.3-Flash) with customizable reasoning effort levels (`low`, `high`, `max`).
+Hardened, high-performance, single-binary AI Gateway & Proxy for the ZCode Start-Plan (GLM-5.3 & GLM-5.3-Flash) with native multi-account scheduling, built-in Web Management Dashboard, and 100% Go standard library implementation.
 
-## Highlights
+> **Project Lineage:** **ZGate** is an independent, production-hardened fork evolved from `zcode-gateway`. We acknowledge and credit the original research by `apissaj`. This project resolves critical security, concurrency, and reliability limitations—adding atomic credential storage, Least-InFlight account scheduling, bounded rate limiting, timing-safe authentication, and an embedded management dashboard.
 
-- **Dual Dialects**: Fully supports standard OpenAI (`/v1/chat/completions`) and Anthropic (`/v1/messages`) protocols.
-- **Reasoning Effort Control**: Fine-tune thinking budget directly via OpenAI parameter `reasoning_effort` or model suffix (`:low`, `:high`, `:max`).
-- **Standard Reasoning Output**: Returns thinking blocks mapped to OpenAI standard `reasoning_content` delta and non-streaming message fields.
-- **Zero Configuration Discovery**: Automatic device mid detection from local desktop installation (`%APPDATA%\ZCode\.updaterId`).
-- **Optimized for Proxy Gateways**: Ready to connect with 9Router, Next.js AI SDK, Claude Code, and OpenAI-compatible tools.
+---
+
+## Key Features & Hardening Overview
+
+- **Dual Wire Dialects:** Native compatibility with both Anthropic (`/v1/messages`) and OpenAI (`/v1/chat/completions`) endpoints.
+- **Embedded Web Dashboard:** Single-binary Web GUI (accessible at `http://127.0.0.1:20131/dashboard`) with SVG icons, one-click Z.ai OAuth login, live request traffic monitoring, and instant 9Router configuration generator.
+- **VPS Administration Protection (`GATEWAY_ADMIN_KEY`):** Secure the Web Dashboard with password authentication for public remote deployments while keeping it accessible on localhost.
+- **Multi-Account Concurrency & Scheduling (ADR 0002):** Dynamic Least-InFlight Round-Robin account selection with per-account concurrency semaphores (`ZCODE_ACCOUNT_CONCURRENCY`) to prevent upstream `429 code 3008` blocks.
+- **Zero Runtime Dependencies:** Built strictly with the Go standard library (`//go:embed` for frontend UI). No Node.js, CGO, or external runtime required.
+- **Production Hardened:** Timing-attack safe comparisons (`crypto/subtle`), DNS rebinding protection (`ZCODE_ALLOWED_HOSTS`), trusted reverse proxy header evaluation, atomic file persistence, and memory-bounded token-bucket rate limiting.
+
+---
 
 ## Supported Models
 
-| Model ID | Reasoning Effort | Best For |
+| Model ID | Reasoning Effort | Target Use Case |
 |---|---|---|
-| `glm-5.3-flash` | Default (`low`) | Fast everyday coding and high-throughput chat |
-| `glm-5.3-flash:low` | Low | Minimal token consumption, lowest latency |
-| `glm-5.3-flash:high` | High | Balanced deep reasoning |
+| `glm-5.3-flash` | Default (`low`) | High-throughput everyday coding, code completions |
+| `glm-5.3-flash:low` | Low | Fast responses with minimal thinking overhead |
+| `glm-5.3-flash:high`| High | Balanced, deeper step-by-step reasoning |
 | `glm-5.3-flash:max` | Max | Complex algorithmic problems and architecture design |
-| `glm-5.3` | Default (`low`) | High parameter precision |
-| `glm-5.3:low` | Low | Standard coding with brief thoughts |
-| `glm-5.3:high` | High | Detailed chain of thought |
-| `glm-5.3:max` | Max | Comprehensive reasoning |
+| `glm-5.3` | Default (`low`) | High-precision flagship reasoning model |
+| `glm-5.3:low` | Low | Flagship precision with brief thoughts |
+| `glm-5.3:high` | High | Detailed chain-of-thought exploration |
+| `glm-5.3:max` | Max | Comprehensive long-form multi-step reasoning |
 
-## Quick Start
+---
 
-### Build & Run
+## How to Run
+
+### Mode 1: Interactive Terminal (Standard)
+
+Compile and run directly in your console:
 
 ```bash
-git clone https://github.com/apissaj/zcode-gateway.git
-cd zcode-gateway
-
-# Build binary
+# Build static binary
 go build -o zcode-gateway.exe ./cmd/zcode-gateway
 
-# Run gateway on custom port (default: 20131 or set PORT)
-PORT=8085 ZCODE_DEFAULT_EFFORT=low ./zcode-gateway.exe
+# Run on default port 20131
+./zcode-gateway.exe
 ```
 
-### Automatic Token Sync (Windows)
+When started, the terminal will print interactive, clickable URLs:
+```text
+  ┌────────────────────────────────────────────────────────┐
+  │ ZGate v0.1.0 (Hardened AI Gateway)                     │
+  │ Status: Running                                        │
+  │ Web Dashboard : http://127.0.0.1:20131/dashboard      │
+  │ API Endpoint  : http://127.0.0.1:20131/v1              │
+  └────────────────────────────────────────────────────────┘
+```
+Hold `Ctrl` and click the Dashboard link to open the GUI in your browser.
 
-Synchronize session JWT directly from your signed-in ZCode desktop IDE:
+---
 
+### Mode 2: Background / Daemon Mode (Headless)
+
+Run the gateway silently in the background without keeping a terminal window open:
+
+#### Windows (PowerShell Background Job)
+```powershell
+Start-Process -FilePath ".\zcode-gateway.exe" -WindowStyle Hidden
+```
+To stop the background process:
+```powershell
+Stop-Process -Name "zcode-gateway"
+```
+
+#### Linux VPS (systemd Service)
+Use the included production unit:
 ```bash
-node sync-token.js
+sudo cp deployments/systemd/zcode-gateway.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now zcode-gateway
 ```
 
-### Usage Examples
-
-#### OpenAI Dialect with Stream (`/v1/chat/completions`)
-
+#### Docker Container
 ```bash
-curl -X POST http://127.0.0.1:8085/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "glm-5.3-flash:low",
-    "messages": [
-      {"role": "user", "content": "Explain binary search in 2 sentences."}
-    ],
-    "stream": true
-  }'
+docker compose -f deployments/docker/docker-compose.yml up -d
 ```
 
-#### Anthropic Dialect (`/v1/messages`)
+---
 
+## Embedded Web Dashboard
+
+Access the graphical dashboard in your browser:
+**`http://127.0.0.1:20131/dashboard`**
+
+- **Quick 9Router Setup:** Displays ready-to-use Base URL, model mappings, active API key, and a 1-click **Copy for 9Router** button.
+- **Account Management:** Add Z.ai accounts via browser OAuth approval, view token status, cooldown countdowns, and set default fallback accounts.
+- **Live Traffic Logs:** Real-time log console showing model calls, latency, and handling accounts.
+- **Daemon Control:** Visual status indicators for listener address and active accounts.
+
+### Securing the Dashboard on a VPS (`GATEWAY_ADMIN_KEY`)
+When hosting on a remote server, set `GATEWAY_ADMIN_KEY`:
 ```bash
-curl -X POST http://127.0.0.1:8085/v1/messages \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "glm-5.3-flash",
-    "thinking": {"type": "enabled", "effort": "low"},
-    "max_tokens": 1024,
-    "messages": [
-      {"role": "user", "content": "Hello!"}
-    ]
-  }'
+export GATEWAY_ADMIN_KEY="your-strong-dashboard-password"
+./zcode-gateway
 ```
+- If `GATEWAY_ADMIN_KEY` is set, visiting `/dashboard` requires entering this key before viewing or managing accounts.
+- If left empty on localhost (`127.0.0.1`), the dashboard is accessible directly without an extra login step.
 
-## Environment Variables
+---
 
-| Variable | Default | Description |
+## Connecting to 9Router
+
+In your 9Router configuration:
+1. **Provider Type:** `OpenAI` / `Chat Completions`
+2. **Base URL:** `http://127.0.0.1:20131/v1`
+3. **Prefix:** `zcode`
+4. **API Key:** Your `ZCODE_BRIDGE_TOKEN` (or any string if running open on localhost).
+5. **Models:** `glm-5.3-flash`, `glm-5.3`
+
+Calls from 9Router will look like `zcode/glm-5.3-flash`.
+
+---
+
+## Configuration Reference
+
+| Environment Variable | Default | Description |
 |---|---|---|
-| `PORT` | `20131` | Listening port (`1`–`65535`) |
-| `BIND_HOST` | `127.0.0.1` | Network interface to bind (takes priority over `HOST` if both are set) |
-| `HOST` | `127.0.0.1` | Fallback network interface to bind when `BIND_HOST` is unset |
-| `ZCODE_BRIDGE_TOKEN` | - | API token (`Authorization: Bearer <token>` or `X-Api-Key`). **Mandatory** when binding to any non-loopback address (`0.0.0.0`, LAN/public IP, or external hostname) |
-| `ZCODE_ALLOWED_HOSTS` | - | Comma-separated exact `Host` header allowlist for reverse-proxy deployments (`X-Forwarded-Host` is not trusted unless rewritten into `Host` by a trusted reverse proxy) |
-| `ZCODE_CORS_ORIGIN` | - | Comma-separated exact browser origins (`https://...`) allowed for CORS (`*` wildcards are rejected) |
-| `ZCODE_TRUSTED_PROXIES` | - | Comma-separated trusted proxy IPs or CIDRs (e.g. `127.0.0.1,::1,10.0.0.0/8`). `X-Forwarded-For` / `X-Real-IP` are ignored unless the TCP peer matches this list |
-| `ZCODE_RATE_LIMIT_RPS` | `20` | Token-bucket refill rate (requests/sec) per client IP. Set `0` to disable rate limiting |
-| `ZCODE_RATE_LIMIT_BURST` | `40` | Token-bucket burst capacity per client IP |
-| `ZCODE_MAX_HEADER_BYTES` | `65536` | Maximum HTTP request header size in bytes (64 KiB) |
-| `ZCODE_READ_HEADER_TIMEOUT_MS` | `10000` | Maximum time in ms allowed to read request headers (10s) |
-| `ZCODE_BODY_READ_TIMEOUT_MS` | `30000` | Maximum time in ms allowed to read the request JSON body (30s; cleared before SSE streaming begins) |
-| `ZCODE_MAX_BODY_BYTES` | `33554432` | Maximum HTTP request body size in bytes (32 MiB) |
-| `ZCODE_SERVER_IDLE_TIMEOUT_MS` | `66000` | HTTP keep-alive idle connection timeout in ms (66s) |
-| `ZCODE_SHUTDOWN_TIMEOUT_MS` | `15000` | Graceful shutdown deadline in ms on `SIGINT`/`SIGTERM` (15s) |
-| `ZCODE_HEADER_TIMEOUT_MS` | `120000` | Upstream Z.ai response header timeout in ms (2m; falls back to `ZCODE_UPSTREAM_TIMEOUT_MS`) |
-| `ZCODE_STREAM_IDLE_TIMEOUT_MS` | `120000` | Per-read idle timeout in ms for upstream SSE streams (2m; active streams have no total wall-clock cap) |
-| `ZCODE_LANE_WIDTH` | `1` | Maximum concurrent upstream inference streams per gateway process |
-| `ZCODE_MAX_ATTEMPTS` | `5` | Maximum in-place retry attempts on transient single-account `3008` errors |
-| `ZCODE_CONCURRENCY_COOLDOWN_MS` | `5000` | Short cooldown in ms applied when rotating accounts on multi-account `3008` errors |
-| `ZCODE_ACCESS_LOG` | - | Set `1`/`true` to log all requests, `0`/`false` to disable all access logs, or leave unset to log operational events (`4xx`/`5xx`, rate limits, timeouts) |
-| `ZCODE_DEFAULT_EFFORT` | `low` | Default reasoning effort when unspecified (`low`, `high`, `max`) |
-| `ZCODE_PLAN_JWT` | - | Manual Plan JWT override |
-| `ZCODE_IDENTITY_DEVICE_MID` | Auto | Device identifier (auto-detected on Windows) |
+| `BIND_HOST` | `127.0.0.1` | Network interface to bind (`127.0.0.1`, `0.0.0.0`, LAN IP) |
+| `PORT` | `20131` | TCP port to listen on |
+| `GATEWAY_ADMIN_KEY` | *(empty)* | Admin password required to access the Web Dashboard |
+| `ZCODE_BRIDGE_TOKEN` | *(empty)* | Secret token required for client API requests (`/v1/*`) |
+| `ZCODE_ALLOWED_HOSTS` | `127.0.0.1,localhost` | Allowed HTTP `Host` header values (DNS rebinding protection) |
+| `ZCODE_TRUSTED_PROXIES` | *(empty)* | Reverse proxy IPs/CIDRs trusted for `X-Forwarded-For` client resolution |
+| `ZCODE_LANE_WIDTH` | `1` | Global maximum concurrent upstream inference streams |
+| `ZCODE_ACCOUNT_CONCURRENCY` | `1` | Maximum concurrent requests allowed per individual stored ZCode account |
+| `ZCODE_RATE_LIMIT_RPS` | `20` | Token-bucket rate limit refill rate per client IP |
+| `ZCODE_RATE_LIMIT_BURST` | `40` | Token-bucket burst limit per client IP |
+| `ZCODE_SHUTDOWN_TIMEOUT_MS` | `15000` | Graceful shutdown timeout in milliseconds (15s) |
+| `ZCODE_ACCOUNTS_FILE` | *(auto)* | Custom filesystem path for `accounts.json` storage |
 
-### Configuration Examples
-
-#### Localhost Deployment (Claude Code / 9Router / Local SDKs)
-
-```bash
-BIND_HOST=127.0.0.1 \
-PORT=20131 \
-ZCODE_LANE_WIDTH=2 \
-./zcode-gateway
-```
-
-#### VPS Deployment Behind a Local Reverse Proxy (Caddy / Nginx)
-
-```bash
-BIND_HOST=127.0.0.1 \
-PORT=20131 \
-ZCODE_BRIDGE_TOKEN="replace-with-32-byte-random-secret" \
-ZCODE_ALLOWED_HOSTS="ai.example.com" \
-ZCODE_TRUSTED_PROXIES="127.0.0.1,::1" \
-ZCODE_RATE_LIMIT_RPS=20 \
-ZCODE_RATE_LIMIT_BURST=40 \
-ZCODE_SHUTDOWN_TIMEOUT_MS=15000 \
-./zcode-gateway
-```
-
-### Reverse Proxy, Rate Limiting & Lifecycle Notes
-
-- **Default Binding & Startup Gate**: Binds to `127.0.0.1:20131` (`BIND_HOST` -> `HOST` -> `127.0.0.1`). Binding to any non-loopback address (`0.0.0.0`, LAN/public IP, or external hostname) without `ZCODE_BRIDGE_TOKEN` aborts startup immediately.
-- **Endpoint Authentication**: When `ZCODE_BRIDGE_TOKEN` is set, `/health`, `/v1/models`, `/models`, `/v1/quota`, `/quota`, `/v1/messages`, and `/v1/chat/completions` require `Authorization: Bearer <token>` or `X-Api-Key: <token>`. `/healthz` remains an unauthenticated minimal liveness check (`{"ok":true}`).
-- **Trusted Proxy & Rate Limiting**: By default (`ZCODE_TRUSTED_PROXIES` empty), `X-Forwarded-For` and `X-Real-IP` are ignored and rate limiting keys strictly on the TCP peer IP (`r.RemoteAddr`). When `ZCODE_TRUSTED_PROXIES` is configured, the gateway inspects `X-Forwarded-For` from right to left and selects the right-most non-trusted client IP so clients cannot spoof leading `X-Forwarded-For` entries or rotate `X-Session-Id`/`User-Agent` headers to bypass limits. Exceeding the bucket returns `429 Too Many Requests` with a `Retry-After` header in the route's API dialect.
-- **Request Timeouts & Long SSE Streams**: Request headers (`ZCODE_READ_HEADER_TIMEOUT_MS`) and request bodies (`ZCODE_BODY_READ_TIMEOUT_MS`, `ZCODE_MAX_BODY_BYTES`) enforce strict deadlines and size limits, then clear the socket read deadline before streaming begins so multi-minute SSE responses are never cut by server read timeouts.
-- **Graceful Shutdown**: On `SIGINT` or `SIGTERM`, the server stops accepting new connections immediately and waits up to `ZCODE_SHUTDOWN_TIMEOUT_MS` for in-flight requests and active SSE streams to finish. If the deadline expires, remaining stream contexts are canceled cleanly and upstream connections/lanes are released.
-- **Reverse Proxy Recommendations**: Configure Nginx/Caddy/Traefik to disable response buffering (`proxy_buffering off;` / `X-Accel-Buffering: no`), set upstream read timeouts to at least `300s` for long reasoning streams, and either rewrite `Host` to `127.0.0.1:20131` or list your public domain in `ZCODE_ALLOWED_HOSTS`.
+---
 
 ## License
 

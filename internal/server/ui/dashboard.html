@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ZGate Dashboard</title>
+  <style>
+    :root {
+      --bg-base: #090d16;
+      --bg-surface: #0f172a;
+      --bg-surface-elevated: #1e293b;
+      --border-subtle: #1e293b;
+      --border-strong: #334155;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --primary: #3b82f6;
+      --primary-hover: #2563eb;
+      --success: #10b981;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+      --code-bg: #030712;
+      --sidebar-width: 240px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, sans-serif; }
+    body { background-color: var(--bg-base); color: var(--text-main); height: 100vh; overflow: hidden; display: flex; }
+    
+    /* Layout */
+    .app-sidebar { width: var(--sidebar-width); background: var(--bg-surface); border-right: 1px solid var(--border-subtle); display: flex; flex-direction: column; flex-shrink: 0; }
+    .app-content { flex: 1; display: flex; flex-direction: column; overflow: hidden; background: var(--bg-base); }
+    .app-topbar { height: 60px; border-bottom: 1px solid var(--border-subtle); background: var(--bg-surface); display: flex; align-items: center; justify-content: space-between; padding: 0 24px; }
+    .main-scroll { flex: 1; overflow-y: auto; padding: 24px; }
+
+    /* Typography & Icons */
+    .icon { width: 18px; height: 18px; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; fill: none; display: inline-block; vertical-align: middle; }
+    .brand { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 15px; color: #fff; padding: 20px 18px; border-bottom: 1px solid var(--border-subtle); }
+    .badge { font-size: 11px; padding: 2px 8px; border-radius: 9999px; background: rgba(59,130,246,0.15); color: #60a5fa; border: 1px solid rgba(59,130,246,0.3); font-weight: 500; }
+    .badge-success { background: rgba(16,185,129,0.15); color: #34d399; border-color: rgba(16,185,129,0.3); }
+
+    /* Nav Links */
+    .nav-list { list-style: none; padding: 12px 10px; flex: 1; }
+    .nav-item { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 6px; color: var(--text-muted); text-decoration: none; font-size: 13px; font-weight: 500; cursor: pointer; transition: all 0.15s ease; margin-bottom: 4px; }
+    .nav-item:hover, .nav-item.active { background: var(--bg-surface-elevated); color: #fff; }
+    .nav-item.active { border-left: 3px solid var(--primary); }
+
+    /* Daemon Control in Sidebar */
+    .sidebar-footer { padding: 16px; border-top: 1px solid var(--border-subtle); }
+    .daemon-card { background: var(--code-bg); border: 1px solid var(--border-subtle); border-radius: 8px; padding: 12px; }
+    .daemon-status { display: flex; align-items: center; justify-content: space-between; font-size: 12px; margin-bottom: 8px; }
+    .dot-online { width: 8px; height: 8px; border-radius: 50%; background: var(--success); display: inline-block; box-shadow: 0 0 8px var(--success); }
+
+    /* Cards & Grids */
+    .grid { display: grid; grid-template-columns: 1fr; gap: 20px; }
+    @media (min-width: 900px) { .grid-2 { grid-template-columns: 1fr 1fr; } }
+    .card { background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: 8px; padding: 20px; }
+    .card-title { font-size: 14px; font-weight: 600; color: #fff; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; }
+
+    /* Buttons & Inputs */
+    .btn { background: var(--primary); color: #fff; border: none; border-radius: 6px; padding: 8px 14px; font-size: 13px; font-weight: 500; cursor: pointer; display: inline-flex; align-items: center; gap: 8px; transition: all 0.15s ease; }
+    .btn:hover { background: var(--primary-hover); }
+    .btn-secondary { background: var(--bg-surface-elevated); border: 1px solid var(--border-strong); color: var(--text-main); }
+    .btn-secondary:hover { background: #334155; }
+    .btn-danger { background: var(--danger); }
+    .btn-danger:hover { background: #dc2626; }
+    .input { background: var(--code-bg); border: 1px solid var(--border-strong); border-radius: 6px; padding: 8px 12px; color: #fff; width: 100%; font-size: 13px; outline: none; margin-bottom: 12px; }
+    .input:focus { border-color: var(--primary); }
+
+    /* Config Display */
+    .config-code { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; color: #93c5fd; background: var(--code-bg); padding: 8px 12px; border-radius: 6px; border: 1px solid var(--border-subtle); }
+
+    /* Table */
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th { text-align: left; padding: 10px 12px; color: var(--text-muted); border-bottom: 1px solid var(--border-subtle); font-weight: 500; }
+    td { padding: 12px; border-bottom: 1px solid var(--border-subtle); vertical-align: middle; }
+
+    /* Modal */
+    .modal-backdrop { display: none; background: rgba(0,0,0,0.75); backdrop-filter: blur(4px); position: fixed; inset: 0; align-items: center; justify-content: center; z-index: 100; }
+    .modal-backdrop.active { display: flex; }
+    .modal { background: var(--bg-surface); border: 1px solid var(--border-strong); border-radius: 10px; width: 100%; max-width: 440px; padding: 24px; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.5); }
+
+    /* Toast */
+    .toast { position: fixed; bottom: 24px; right: 24px; background: var(--primary); color: #fff; padding: 10px 18px; border-radius: 6px; font-size: 13px; display: none; z-index: 200; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.3); }
+
+    /* Tab views */
+    .tab-view { display: none; }
+    .tab-view.active { display: block; }
+  </style>
+</head>
+<body>
+  <!-- Sidebar -->
+  <aside class="app-sidebar">
+    <div class="brand">
+      <svg class="icon" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg>
+      <span>ZGate</span>
+      <span class="badge">v0.1.0</span>
+    </div>
+
+    <ul class="nav-list">
+      <li class="nav-item active" onclick="switchTab('dashboard', this)">
+        <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
+        <span>Dashboard</span>
+      </li>
+      <li class="nav-item" onclick="switchTab('accounts', this)">
+        <svg class="icon" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M23 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></svg>
+        <span>Accounts</span>
+      </li>
+      <li class="nav-item" onclick="switchTab('routing', this)">
+        <svg class="icon" viewBox="0 0 24 24"><circle cx="18" cy="5" r="3"></circle><circle cx="6" cy="12" r="3"></circle><circle cx="18" cy="19" r="3"></circle><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"></line><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"></line></svg>
+        <span>9Router Setup</span>
+      </li>
+    </ul>
+
+    <div class="sidebar-footer">
+      <div class="daemon-card">
+        <div class="daemon-status">
+          <span style="color:var(--text-muted);">Daemon Node</span>
+          <span><span class="dot-online"></span> <strong id="daemonStatusText">ONLINE</strong></span>
+        </div>
+        <div style="font-size:11px; color:var(--text-muted); line-height:1.6;" id="daemonHostText">127.0.0.1:20131</div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Main View Area -->
+  <main class="app-content">
+    <header class="app-topbar">
+      <div style="display:flex; align-items:center; gap:12px;">
+        <span class="badge badge-success" id="authBadge">Protected Mode</span>
+        <span style="font-size:13px; color:var(--text-muted);" id="headerNodeInfo">Port: 20131</span>
+      </div>
+      <div style="display:flex; gap:10px;">
+        <button class="btn btn-secondary" onclick="loadDashboard()">
+          <svg class="icon" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
+          Refresh
+        </button>
+        <button class="btn" onclick="startLoginModal()">
+          <svg class="icon" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+          Add Z.ai Account
+        </button>
+      </div>
+    </header>
+
+    <div class="main-scroll">
+      <!-- Tab 1: Dashboard Overview -->
+      <section id="tab-dashboard" class="tab-view active">
+        <div class="grid grid-2" style="margin-bottom:20px;">
+          <div class="card">
+            <h3 class="card-title">
+              <svg class="icon" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"></rect><rect x="2" y="14" width="20" height="8" rx="2" ry="2"></rect><line x1="6" y1="6" x2="6.01" y2="6"></line><line x1="6" y1="18" x2="6.01" y2="18"></line></svg>
+              Fast 9Router Configuration
+            </h3>
+            <p style="font-size:12px; color:var(--text-muted); margin-bottom:12px;">Connect your local 9Router to this gateway node:</p>
+            <div style="display:flex; flex-direction:column; gap:8px; margin-bottom:14px;">
+              <div><span style="font-size:12px; color:var(--text-muted)">Base URL:</span> <div class="config-code" id="dashBaseUrl">http://127.0.0.1:20131/v1</div></div>
+              <div><span style="font-size:12px; color:var(--text-muted)">Prefix:</span> <div class="config-code">zcode</div></div>
+            </div>
+            <button class="btn" style="width:100%; justify-content:center;" onclick="copy9RouterConfig()">
+              <svg class="icon" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+              Copy 9Router Parameters
+            </button>
+          </div>
+
+          <div class="card">
+            <h3 class="card-title">
+              <svg class="icon" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"></path></svg>
+              Node Performance & Metrics
+            </h3>
+            <div style="font-size:13px; line-height:2.2;">
+              <div style="display:flex; justify-content:space-between; border-bottom:1px solid var(--border-subtle)">
+                <span style="color:var(--text-muted)">Scheduler Mode</span>
+                <span>Least-InFlight Round-Robin</span>
+              </div>
+              <div style="display:flex; justify-content:space-between; border-bottom:1px solid var(--border-subtle)">
+                <span style="color:var(--text-muted)">Global Lane Width</span>
+                <strong id="dashLaneWidth">1</strong>
+              </div>
+              <div style="display:flex; justify-content:space-between; border-bottom:1px solid var(--border-subtle)">
+                <span style="color:var(--text-muted)">Active Account Pool</span>
+                <strong id="dashAcctCount">0</strong>
+              </div>
+              <div style="display:flex; justify-content:space-between;">
+                <span style="color:var(--text-muted)">Rate Limiter</span>
+                <span>Token-Bucket (20 rps / 40 burst)</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Accounts Summary -->
+        <div class="card">
+          <h3 class="card-title">
+            <svg class="icon" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
+            Active Credential Pool
+          </h3>
+          <table>
+            <thead>
+              <tr>
+                <th>Status</th>
+                <th>Account Label</th>
+                <th>Token Expiry</th>
+                <th>Cooldown</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="overviewAccountRows">
+              <tr><td colspan="5" style="text-align:center; color:var(--text-muted); padding:20px;">Loading accounts...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Tab 2: Accounts Management -->
+      <section id="tab-accounts" class="tab-view">
+        <div class="card">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+            <h3 class="card-title" style="margin:0;">
+              <svg class="icon" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle></svg>
+              Stored Z.ai Accounts
+            </h3>
+            <button class="btn" onclick="startLoginModal()">+ Add New Account</button>
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th>Status</th>
+                <th>Identifier / Label</th>
+                <th>Refreshable</th>
+                <th>Cooldown Timer</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="fullAccountRows">
+              <tr><td colspan="5" style="text-align:center; color:var(--text-muted); padding:20px;">Loading...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Tab 3: 9Router & Models Integration -->
+      <section id="tab-routing" class="tab-view">
+        <div class="card" style="margin-bottom:20px;">
+          <h3 class="card-title">
+            <svg class="icon" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg>
+            Provider Setup Instructions for 9Router
+          </h3>
+          <p style="font-size:13px; color:var(--text-muted); line-height:1.7; margin-bottom:16px;">
+            1. Open your 9Router local dashboard.<br>
+            2. Add a new Provider node with <strong>API Type: Chat Completions</strong>.<br>
+            3. Set <strong>Base URL:</strong> <code class="config-code" id="routeBaseUrl">http://127.0.0.1:20131/v1</code><br>
+            4. Set <strong>Prefix:</strong> <code class="config-code">zcode</code><br>
+            5. In the Model mapping field, add <code>glm-5.3-flash</code> or <code>glm-5.3</code>.
+          </p>
+          <div style="display:flex; gap:10px;">
+            <button class="btn" onclick="copy9RouterConfig()">Copy JSON Configuration</button>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <!-- Login Modal -->
+  <div class="modal-backdrop" id="loginModal">
+    <div class="modal">
+      <h3 style="font-size:16px; margin-bottom:8px; color:#fff;">Add Z.ai Account</h3>
+      <p style="font-size:13px; color:var(--text-muted); margin-bottom:16px;">Sign in via official Z.ai OAuth device flow.</p>
+      
+      <input type="text" id="loginLabel" class="input" placeholder="Account Label (e.g. Work, Personal)">
+      
+      <div id="loginStep1">
+        <button class="btn" style="width:100%; justify-content:center;" onclick="requestLoginCode()">Generate Login Link</button>
+      </div>
+
+      <div id="loginStep2" style="display:none; text-align:center; margin-top:14px;">
+        <a id="loginAuthUrl" href="#" target="_blank" class="btn" style="width:100%; justify-content:center; margin-bottom:10px;">Open Z.ai Approval Page</a>
+        <p style="font-size:12px; color:var(--text-muted);">Waiting for browser authorization...</p>
+      </div>
+
+      <div style="margin-top:18px; text-align:right;">
+        <button class="btn btn-secondary" onclick="closeLoginModal()">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Password Gate Modal for VPS Admin Key -->
+  <div class="modal-backdrop" id="adminAuthModal">
+    <div class="modal">
+      <h3 style="font-size:16px; margin-bottom:8px; color:#fff;">Gateway Admin Access</h3>
+      <p style="font-size:13px; color:var(--text-muted); margin-bottom:16px;">Enter the GATEWAY_ADMIN_KEY password configured on this server:</p>
+      <input type="password" id="adminPasswordInput" class="input" placeholder="Admin Password">
+      <div style="text-align:right; margin-top:10px;">
+        <button class="btn" style="width:100%; justify-content:center;" onclick="submitAdminLogin()">Unlock Dashboard</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast">Copied to clipboard!</div>
+
+  <script>
+    let pollInterval = null;
+
+    function switchTab(tabId, el) {
+      document.querySelectorAll('.tab-view').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.nav-item').forEach(i => i.classList.remove('active'));
+      const activeTab = document.getElementById('tab-' + tabId);
+      if (activeTab) activeTab.classList.add('active');
+      if (el) el.classList.add('active');
+    }
+
+    async function checkAuth() {
+      try {
+        const res = await fetch('/api/dashboard/auth/verify');
+        const data = await res.json();
+        if (data.requiresAuth && !data.authorized) {
+          document.getElementById('adminAuthModal').classList.add('active');
+          return false;
+        }
+        document.getElementById('adminAuthModal').classList.remove('active');
+        return true;
+      } catch (e) {
+        return true;
+      }
+    }
+
+    async function submitAdminLogin() {
+      const key = document.getElementById('adminPasswordInput').value.trim();
+      const res = await fetch('/api/dashboard/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key })
+      });
+      const data = await res.json();
+      if (data.ok) {
+        document.getElementById('adminAuthModal').classList.remove('active');
+        loadDashboard();
+      } else {
+        alert('Invalid admin password');
+      }
+    }
+
+    async function loadDashboard() {
+      const ok = await checkAuth();
+      if (!ok) return;
+
+      try {
+        const res = await fetch('/api/dashboard/status');
+        const data = await res.json();
+        const base = window.location.origin + '/v1';
+        document.getElementById('dashBaseUrl').textContent = base;
+        document.getElementById('routeBaseUrl').textContent = base;
+        document.getElementById('dashLaneWidth').textContent = data.laneWidth || '1';
+        document.getElementById('dashAcctCount').textContent = (data.accounts || []).length;
+        document.getElementById('headerNodeInfo').textContent = window.location.host;
+
+        renderAccounts(data.accounts || []);
+      } catch (err) {
+        console.error('Failed to load dashboard:', err);
+      }
+    }
+
+    function renderAccounts(accounts) {
+      const rows = accounts.map(a => {
+        let stateBadge = '<span class="badge badge-success">Ready</span>';
+        if (a.needsReauth) stateBadge = '<span class="badge" style="background:rgba(239,68,68,0.2); color:#f87171">Re-auth Required</span>';
+        else if (a.expired) stateBadge = '<span class="badge" style="background:rgba(245,158,11,0.2); color:#fbbf24">Expired</span>';
+        else if (a.cooldownUntil) stateBadge = '<span class="badge" style="background:rgba(245,158,11,0.2); color:#fbbf24">Cooling Down</span>';
+
+        return `
+          <tr>
+            <td>${stateBadge}</td>
+            <td><strong>${escapeHtml(a.label || a.id)}</strong> ${a.default ? '<span class="badge" style="margin-left:6px;">Default</span>' : ''}</td>
+            <td>${a.hasRefresh ? 'Available' : 'None'}</td>
+            <td>${a.cooldownUntil ? escapeHtml(a.cooldownUntil) : '-'}</td>
+            <td>
+              ${!a.default ? `<button class="btn btn-secondary" style="padding:2px 8px; font-size:11px;" onclick="setDefaultAccount('${a.id}')">Set Default</button>` : ''}
+              <button class="btn btn-danger" style="padding:2px 8px; font-size:11px; margin-left:4px;" onclick="removeAccount('${a.id}')">Delete</button>
+            </td>
+          </tr>
+        `;
+      }).join('');
+
+      const empty = '<tr><td colspan="5" style="text-align:center; color:var(--text-muted); padding:20px;">No accounts stored. Click "+ Add Z.ai Account" to begin.</td></tr>';
+      document.getElementById('overviewAccountRows').innerHTML = rows || empty;
+      document.getElementById('fullAccountRows').innerHTML = rows || empty;
+    }
+
+    async function setDefaultAccount(id) {
+      await fetch('/api/dashboard/account/default?id=' + encodeURIComponent(id), { method: 'POST' });
+      loadDashboard();
+    }
+
+    async function removeAccount(id) {
+      if (!confirm('Are you sure you want to remove this account?')) return;
+      await fetch('/api/dashboard/account/remove?id=' + encodeURIComponent(id), { method: 'POST' });
+      loadDashboard();
+    }
+
+    function startLoginModal() {
+      document.getElementById('loginStep1').style.display = 'block';
+      document.getElementById('loginStep2').style.display = 'none';
+      document.getElementById('loginLabel').value = '';
+      document.getElementById('loginModal').classList.add('active');
+    }
+
+    function closeLoginModal() {
+      document.getElementById('loginModal').classList.remove('active');
+      if (pollInterval) clearInterval(pollInterval);
+    }
+
+    async function requestLoginCode() {
+      const label = document.getElementById('loginLabel').value.trim();
+      const res = await fetch('/api/dashboard/login/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label })
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        alert('Failed to start login: ' + (data.error || 'unknown'));
+        return;
+      }
+      document.getElementById('loginStep1').style.display = 'none';
+      document.getElementById('loginStep2').style.display = 'block';
+      const authLink = document.getElementById('loginAuthUrl');
+      authLink.href = data.authUrl;
+
+      if (pollInterval) clearInterval(pollInterval);
+      pollInterval = setInterval(async () => {
+        const pollRes = await fetch('/api/dashboard/login/poll?flowId=' + encodeURIComponent(data.flowId) + '&label=' + encodeURIComponent(label));
+        const pollData = await pollRes.json();
+        if (pollData.status === 'success') {
+          clearInterval(pollInterval);
+          closeLoginModal();
+          showToast('Account added successfully!');
+          loadDashboard();
+        } else if (pollData.status === 'failed') {
+          clearInterval(pollInterval);
+          alert('Login failed: ' + pollData.error);
+          closeLoginModal();
+        }
+      }, 2500);
+    }
+
+    function copy9RouterConfig() {
+      const config = {
+        name: "ZGate",
+        type: "Chat Completions",
+        base_url: window.location.origin + "/v1",
+        prefix: "zcode",
+        models: ["glm-5.3-flash", "glm-5.3"]
+      };
+      navigator.clipboard.writeText(JSON.stringify(config, null, 2));
+      showToast('9Router config copied to clipboard!');
+    }
+
+    function showToast(msg) {
+      const t = document.getElementById('toast');
+      t.textContent = msg;
+      t.style.display = 'block';
+      setTimeout(() => { t.style.display = 'none'; }, 2200);
+    }
+
+    function escapeHtml(str) {
+      return (str || '').replace(/[&<>"']/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[m]);
+    }
+
+    window.onload = loadDashboard;
+  </script>
+</body>
+</html>
