@@ -1,7 +1,13 @@
 package server
 
 import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
+	"math"
 	"mime"
 	"net"
 	"net/http"
@@ -9,6 +15,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apissaj/zcode-gateway/internal/accounts"
@@ -18,6 +26,263 @@ import (
 	"github.com/apissaj/zcode-gateway/internal/quota"
 	"github.com/apissaj/zcode-gateway/internal/transport"
 )
+
+// statusRecorder wraps http.ResponseWriter to capture HTTP status and event
+// tags for operational logging while preserving http.Flusher and
+// http.ResponseController (via Unwrap).
+type statusRecorder struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+	eventTag    string
+}
+
+func (sr *statusRecorder) WriteHeader(code int) {
+	if !sr.wroteHeader {
+		sr.status = code
+		sr.wroteHeader = true
+	}
+	sr.ResponseWriter.WriteHeader(code)
+}
+
+func (sr *statusRecorder) Write(b []byte) (int, error) {
+	if !sr.wroteHeader {
+		sr.status = http.StatusOK
+		sr.wroteHeader = true
+	}
+	return sr.ResponseWriter.Write(b)
+}
+
+func (sr *statusRecorder) Flush() {
+	if f, ok := sr.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (sr *statusRecorder) Unwrap() http.ResponseWriter {
+	return sr.ResponseWriter
+}
+
+func setEventTag(w http.ResponseWriter, tag string) {
+	if sr, ok := w.(*statusRecorder); ok && sr.eventTag == "" {
+		sr.eventTag = tag
+	}
+}
+
+func requestIDFor(r *http.Request) string {
+	if incoming := strings.TrimSpace(r.Header.Get("X-Request-Id")); incoming != "" && len(incoming) <= 64 {
+		valid := true
+		for i := 0; i < len(incoming); i++ {
+			c := incoming[i]
+			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+				valid = false
+				break
+			}
+		}
+		if valid {
+			return incoming
+		}
+	}
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		return "req_" + hex.EncodeToString(b[:])
+	}
+	seq := atomic.AddUint64(&reqCounter, 1)
+	return fmt.Sprintf("req_%d_%d", time.Now().UnixNano(), seq)
+}
+
+func logRequest(reqID, method, path string, status int, dur time.Duration, eventTag string) {
+	c := getConfig()
+	logFn := c.LogFunc
+	if logFn == nil {
+		rawToggle := strings.ToLower(strings.TrimSpace(os.Getenv("ZCODE_ACCESS_LOG")))
+		if rawToggle == "0" || rawToggle == "false" || rawToggle == "off" {
+			return
+		}
+		if rawToggle == "" {
+			// Default: only log when ZCODE_ACCESS_LOG is enabled or on operational events (429/408/5xx).
+			if status < 400 && eventTag == "" {
+				return
+			}
+		}
+		logFn = func(format string, args ...any) {
+			fmt.Fprintf(os.Stderr, format+"\n", args...)
+		}
+	}
+	safePath := redactMsg(path)
+	if eventTag != "" {
+		logFn("[access] req_id=%s method=%s path=%s status=%d duration_ms=%d event=%s",
+			reqID, method, safePath, status, dur.Milliseconds(), eventTag)
+	} else {
+		logFn("[access] req_id=%s method=%s path=%s status=%d duration_ms=%d",
+			reqID, method, safePath, status, dur.Milliseconds())
+	}
+}
+
+// --- Token-bucket rate limiter & trusted proxy handling ---
+
+type rateBucket struct {
+	tokens   float64
+	lastSeen time.Time
+}
+
+var (
+	rateMu      sync.Mutex
+	rateBuckets = map[string]*rateBucket{}
+)
+
+func resetRateLimiter() {
+	rateMu.Lock()
+	rateBuckets = map[string]*rateBucket{}
+	rateMu.Unlock()
+}
+
+func rateLimitConfig() (rps float64, burst int) {
+	rps = DefaultRateLimitRPS
+	if v := strings.TrimSpace(os.Getenv("ZCODE_RATE_LIMIT_RPS")); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			rps = f
+		}
+	}
+	burst = DefaultRateLimitBurst
+	if v := strings.TrimSpace(os.Getenv("ZCODE_RATE_LIMIT_BURST")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			burst = n
+		}
+	}
+	if rps > 0 && float64(burst) < 1 {
+		burst = 1
+	}
+	return rps, burst
+}
+
+// isTrustedProxy checks whether remoteIP matches an explicit entry (IP or CIDR)
+// in ZCODE_TRUSTED_PROXIES. When ZCODE_TRUSTED_PROXIES is empty, no proxy is
+// trusted and X-Forwarded-For / X-Real-IP are ignored.
+func isTrustedProxy(remoteIP net.IP) bool {
+	if remoteIP == nil {
+		return false
+	}
+	raw := strings.TrimSpace(os.Getenv("ZCODE_TRUSTED_PROXIES"))
+	if raw == "" {
+		return false
+	}
+	for _, item := range strings.Split(raw, ",") {
+		entry := strings.TrimSpace(item)
+		if entry == "" {
+			continue
+		}
+		if strings.Contains(entry, "/") {
+			if _, cidr, err := net.ParseCIDR(entry); err == nil && cidr.Contains(remoteIP) {
+				return true
+			}
+			continue
+		}
+		if ip := net.ParseIP(entry); ip != nil && ip.Equal(remoteIP) {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveClientIP determines the caller's IP address for rate limiting.
+// Forwarded headers are consulted ONLY when r.RemoteAddr belongs to
+// ZCODE_TRUSTED_PROXIES, walking X-Forwarded-For right-to-left so a client
+// cannot spoof leading X-Forwarded-For entries to bypass rate limits.
+func resolveClientIP(r *http.Request) string {
+	host := strings.TrimSpace(r.RemoteAddr)
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	remoteIP := net.ParseIP(host)
+	if remoteIP == nil {
+		return "unknown"
+	}
+	if !isTrustedProxy(remoteIP) {
+		return remoteIP.String()
+	}
+
+	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
+		parts := strings.Split(xff, ",")
+		for i := len(parts) - 1; i >= 0; i-- {
+			cand := strings.Trim(strings.TrimSpace(parts[i]), "[]")
+			if h, _, err := net.SplitHostPort(cand); err == nil {
+				cand = h
+			}
+			ip := net.ParseIP(cand)
+			if ip == nil {
+				continue
+			}
+			if !isTrustedProxy(ip) {
+				return ip.String()
+			}
+		}
+	}
+	if xri := strings.Trim(strings.TrimSpace(r.Header.Get("X-Real-IP")), "[]"); xri != "" {
+		if ip := net.ParseIP(xri); ip != nil {
+			return ip.String()
+		}
+	}
+	return remoteIP.String()
+}
+
+// clientRateKey derives the rate-limit bucket key. Unauthenticated callers are
+// keyed strictly by resolved client IP so rotating arbitrary headers (X-Session-Id,
+// User-Agent, etc.) cannot bypass limits.
+func clientRateKey(r *http.Request) string {
+	ip := resolveClientIP(r)
+	if expected := strings.TrimSpace(getConfig().BridgeToken); expected != "" && authorized(r) {
+		sum := sha256.Sum256([]byte(expected))
+		return "ip:" + ip + ":auth:" + hex.EncodeToString(sum[:4])
+	}
+	return "ip:" + ip
+}
+
+func allowRequest(r *http.Request) (bool, int) {
+	rps, burst := rateLimitConfig()
+	if rps <= 0 {
+		return true, 0
+	}
+	key := clientRateKey(r)
+	now := time.Now()
+
+	rateMu.Lock()
+	defer rateMu.Unlock()
+
+	if len(rateBuckets) > 4096 {
+		for k, b := range rateBuckets {
+			if now.Sub(b.lastSeen) > 5*time.Minute {
+				delete(rateBuckets, k)
+			}
+		}
+	}
+
+	b, ok := rateBuckets[key]
+	if !ok {
+		rateBuckets[key] = &rateBucket{
+			tokens:   float64(burst) - 1,
+			lastSeen: now,
+		}
+		return true, 0
+	}
+
+	elapsed := now.Sub(b.lastSeen).Seconds()
+	if elapsed > 0 {
+		b.tokens = math.Min(float64(burst), b.tokens+elapsed*rps)
+		b.lastSeen = now
+	}
+	if b.tokens >= 1 {
+		b.tokens -= 1
+		return true, 0
+	}
+	deficit := 1.0 - b.tokens
+	retrySec := int(math.Ceil(deficit / rps))
+	if retrySec < 1 {
+		retrySec = 1
+	}
+	return false, retrySec
+}
 
 // Route dispatches one request; handler errors that happen after the
 // headers are sent are impossible here because every handler writes its
@@ -34,19 +299,38 @@ func dialectForPath(path string) string {
 	return "anthropic"
 }
 
-func route(w http.ResponseWriter, r *http.Request) {
+func route(origW http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	reqID := requestIDFor(r)
+	origW.Header().Set("X-Request-Id", reqID)
+	w := &statusRecorder{ResponseWriter: origW, status: http.StatusOK}
+	pathName := strings.TrimRight(r.URL.Path, "/")
+	if pathName == "" {
+		pathName = "/"
+	}
+	defer func() {
+		logRequest(reqID, r.Method, pathName, w.status, time.Since(start), w.eventTag)
+	}()
+
 	reqDialect := dialectForPath(r.URL.Path)
 	if !validHostHeader(r, getConfig()) {
+		setEventTag(w, "invalid_host")
 		writeDialectError(w, reqDialect, http.StatusForbidden, "Invalid Host header", "forbidden_error")
 		return
 	}
 	if !cors(w, r, reqDialect) {
 		return // preflight or rejected cross-origin request handled
 	}
-	pathName := strings.TrimRight(r.URL.Path, "/")
-	if pathName == "" {
-		pathName = "/"
+
+	if pathName != "/healthz" {
+		if ok, retryAfter := allowRequest(r); !ok {
+			setEventTag(w, "rate_limited")
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+			writeDialectError(w, reqDialect, http.StatusTooManyRequests, "Rate limit exceeded; retry later", "rate_limit_error")
+			return
+		}
 	}
+
 	accountID := r.URL.Query().Get("account")
 	if accountID == "" {
 		accountID = r.Header.Get("X-Zcode-Account")
@@ -119,12 +403,24 @@ func handlePost(w http.ResponseWriter, r *http.Request, accountID, dialect strin
 		writeDialectError(w, dialect, http.StatusUnsupportedMediaType, "Content-Type must be application/json", "invalid_request_error")
 		return
 	}
-	raw, err := readBody(r)
+	raw, err := readBody(w, r)
 	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			setEventTag(w, "body_too_large")
+			writeDialectError(w, dialect, http.StatusRequestEntityTooLarge, "Request body too large", "invalid_request_error")
+			return
+		}
+		if errors.Is(err, errBodyReadTimeout) {
+			setEventTag(w, "body_read_timeout")
+			writeDialectError(w, dialect, http.StatusRequestTimeout, "Request body read timeout", "timeout_error")
+			return
+		}
 		writeDialectError(w, dialect, http.StatusBadRequest, "Failed to read request body", "invalid_request_error")
 		return
 	}
-	if len(raw) > maxBodyBytes {
+	if int64(len(raw)) > maxBodyBytesLimit() {
+		setEventTag(w, "body_too_large")
 		writeDialectError(w, dialect, http.StatusRequestEntityTooLarge, "Request body too large", "invalid_request_error")
 		return
 	}
@@ -293,20 +589,96 @@ func cors(w http.ResponseWriter, r *http.Request, dialect string) bool {
 	return true
 }
 
-// ListenAndServe validates the server configuration and starts the HTTP server.
-// keepAlive timeouts mirror the JS server's 65s values so long SSE streams
-// survive intermediary idle cuts.
-func ListenAndServe() error {
+// NewHTTPServer constructs a hardened *http.Server with bounded header size,
+// ReadHeaderTimeout, and IdleTimeout, while deliberately omitting a connection-wide
+// ReadTimeout/WriteTimeout so long-lived SSE streams are never severed.
+func NewHTTPServer(baseCtx context.Context) (*http.Server, error) {
 	c := getConfig()
 	if err := ValidateConfig(c); err != nil {
-		return err
+		return nil, err
 	}
 	addr := net.JoinHostPort(c.Host, strconv.Itoa(c.Port))
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           Route(),
-		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       66 * time.Second,
+		ReadHeaderTimeout: readHeaderTimeout(),
+		MaxHeaderBytes:    maxHeaderBytesLimit(),
+		IdleTimeout:       serverIdleTimeout(),
 	}
-	return srv.ListenAndServe()
+	if baseCtx != nil {
+		srv.BaseContext = func(net.Listener) context.Context {
+			return baseCtx
+		}
+	}
+	return srv, nil
+}
+
+// Serve runs the HTTP server on ln until ctx is canceled, then performs a
+// bounded graceful shutdown (stopping new connections, letting in-flight
+// requests finish up to ShutdownTimeout, and canceling active stream contexts
+// if the shutdown deadline is exceeded).
+func Serve(ctx context.Context, ln net.Listener) error {
+	reqCtx, cancelRequests := context.WithCancel(context.Background())
+	defer cancelRequests()
+
+	srv, err := NewHTTPServer(reqCtx)
+	if err != nil {
+		return err
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.Serve(ln)
+	}()
+
+	select {
+	case err := <-errCh:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), ShutdownTimeout())
+		defer cancel()
+
+		// Signal active streams/handlers when the graceful shutdown window expires.
+		stopAfter := time.AfterFunc(ShutdownTimeout(), func() {
+			cancelRequests()
+		})
+		defer stopAfter.Stop()
+
+		shutdownErr := srv.Shutdown(shutdownCtx)
+		if shutdownErr != nil {
+			cancelRequests()
+			_ = srv.Close()
+		}
+		serveErr := <-errCh
+		if shutdownErr != nil && !errors.Is(shutdownErr, http.ErrServerClosed) {
+			return shutdownErr
+		}
+		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			return serveErr
+		}
+		return nil
+	}
+}
+
+// ListenAndServeContext binds the configured address and serves until ctx is
+// canceled, executing graceful shutdown on cancellation.
+func ListenAndServeContext(ctx context.Context) error {
+	c := getConfig()
+	if err := ValidateConfig(c); err != nil {
+		return err
+	}
+	addr := net.JoinHostPort(c.Host, strconv.Itoa(c.Port))
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	return Serve(ctx, ln)
+}
+
+// ListenAndServe validates the server configuration and starts the HTTP server.
+func ListenAndServe() error {
+	return ListenAndServeContext(context.Background())
 }

@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -37,7 +38,21 @@ import (
 	"github.com/apissaj/zcode-gateway/internal/transport"
 )
 
-const maxBodyBytes = 32 << 20
+const (
+	DefaultMaxBodyBytes      int64   = 32 << 20 // 32 MiB
+	DefaultMaxHeaderBytes    int     = 64 << 10 // 64 KiB
+	DefaultReadHeaderTimeout         = 10 * time.Second
+	DefaultBodyReadTimeout           = 30 * time.Second
+	DefaultServerIdleTimeout         = 66 * time.Second
+	DefaultShutdownTimeout           = 15 * time.Second
+	DefaultRateLimitRPS      float64 = 20
+	DefaultRateLimitBurst    int     = 40
+)
+
+var (
+	errBodyReadTimeout = errors.New("request body read timeout")
+	reqCounter         uint64
+)
 
 // Config is the server's runtime configuration.
 type Config struct {
@@ -45,6 +60,7 @@ type Config struct {
 	Host        string
 	BridgeToken string
 	ModelsCache time.Duration
+	LogFunc     func(format string, args ...any)
 }
 
 var (
@@ -152,6 +168,7 @@ func Configure(c Config) {
 	modelsMu.Lock()
 	modelsCache = nil
 	modelsMu.Unlock()
+	resetRateLimiter()
 }
 
 func getConfig() Config {
@@ -230,8 +247,114 @@ func authorized(r *http.Request) bool {
 	return constantTimeTokenEqual(presented, expected)
 }
 
-func readBody(r *http.Request) ([]byte, error) {
-	return io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
+func maxBodyBytesLimit() int64 {
+	if v := strings.TrimSpace(os.Getenv("ZCODE_MAX_BODY_BYTES")); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	return DefaultMaxBodyBytes
+}
+
+func maxHeaderBytesLimit() int {
+	if v := strings.TrimSpace(os.Getenv("ZCODE_MAX_HEADER_BYTES")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return DefaultMaxHeaderBytes
+}
+
+func readHeaderTimeout() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("ZCODE_READ_HEADER_TIMEOUT_MS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Millisecond
+		}
+	}
+	return DefaultReadHeaderTimeout
+}
+
+func bodyReadTimeout() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("ZCODE_BODY_READ_TIMEOUT_MS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Millisecond
+		}
+	}
+	return DefaultBodyReadTimeout
+}
+
+func serverIdleTimeout() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("ZCODE_SERVER_IDLE_TIMEOUT_MS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Millisecond
+		}
+	}
+	return DefaultServerIdleTimeout
+}
+
+// ShutdownTimeout resolves the graceful shutdown deadline from ZCODE_SHUTDOWN_TIMEOUT_MS.
+func ShutdownTimeout() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("ZCODE_SHUTDOWN_TIMEOUT_MS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Millisecond
+		}
+	}
+	return DefaultShutdownTimeout
+}
+
+// readBody enforces both a maximum byte size (http.MaxBytesReader) and a
+// bounded body-read deadline that is cleared before streaming begins so long
+// SSE responses are never interrupted.
+func readBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+	limit := maxBodyBytesLimit()
+	timeout := bodyReadTimeout()
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+
+	rc := http.NewResponseController(w)
+	if err := rc.SetReadDeadline(time.Now().Add(timeout)); err == nil {
+		defer func() {
+			// Clear the socket read deadline so long-lived SSE streams are not cut.
+			_ = rc.SetReadDeadline(time.Time{})
+		}()
+		data, readErr := io.ReadAll(r.Body)
+		if isTimeoutErr(readErr) {
+			return nil, errBodyReadTimeout
+		}
+		return data, readErr
+	}
+
+	// Fallback when ResponseWriter does not support SetReadDeadline (e.g. httptest.ResponseRecorder).
+	type readResult struct {
+		data []byte
+		err  error
+	}
+	ch := make(chan readResult, 1)
+	body := r.Body
+	go func() {
+		b, err := io.ReadAll(body)
+		ch <- readResult{data: b, err: err}
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case res := <-ch:
+		return res.data, res.err
+	case <-timer.C:
+		return nil, errBodyReadTimeout
+	case <-r.Context().Done():
+		return nil, r.Context().Err()
+	}
+}
+
+func isTimeoutErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	return errors.Is(err, os.ErrDeadlineExceeded)
 }
 
 func parseJSON(raw []byte) (map[string]any, bool) {
@@ -386,6 +509,12 @@ func relayUpstreamError(w http.ResponseWriter, err error, dialect string) {
 		typ = "invalid_request_error"
 	}
 
+	if status == http.StatusGatewayTimeout {
+		setEventTag(w, "upstream_timeout")
+	} else {
+		setEventTag(w, "upstream_error")
+	}
+
 	if dialect == "openai" {
 		openAIErrorWithType(w, status, message, typ, code)
 		return
@@ -504,6 +633,11 @@ func pipeStream(w http.ResponseWriter, upstream *http.Response, dialect, model s
 	}
 
 	emitStreamError := func(msg, errType string) {
+		if errType == "timeout_error" {
+			setEventTag(w, "stream_idle_timeout")
+		} else {
+			setEventTag(w, "upstream_stream_error")
+		}
 		safeMsg := redactMsg(msg)
 		if safeMsg == "" {
 			safeMsg = "upstream stream error"
