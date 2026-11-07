@@ -588,7 +588,7 @@ func validHostHeader(r *http.Request, c Config) bool {
 	return strings.EqualFold(reqHost, bindHost) || IsLoopbackHost(reqHost)
 }
 
-func isAllowedOrigin(origin, rawAllowlist string) bool {
+func isAllowedOrigin(origin, rawAllowlist string, reqHost string) bool {
 	if origin == "" {
 		return false
 	}
@@ -600,6 +600,18 @@ func isAllowedOrigin(origin, rawAllowlist string) bool {
 	origHost := extractRequestHost(parsedOrigin.Host)
 	if IsLoopbackHost(origHost) {
 		return true
+	}
+	// Allow same-origin requests (origin host matches the request Host header)
+	cleanReqHost := extractRequestHost(reqHost)
+	if cleanReqHost != "" && strings.EqualFold(origHost, cleanReqHost) {
+		return true
+	}
+	// Allow origins whose host matches any configured ZCODE_ALLOWED_HOSTS entry
+	for _, allowed := range strings.Split(os.Getenv("ZCODE_ALLOWED_HOSTS"), ",") {
+		a := extractRequestHost(allowed)
+		if a != "" && a != "*" && strings.EqualFold(origHost, a) {
+			return true
+		}
 	}
 	if rawAllowlist == "" {
 		return false
@@ -626,7 +638,7 @@ func cors(w http.ResponseWriter, r *http.Request, dialect string) bool {
 	secFetchSite := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")))
 
 	if origin != "" {
-		if !isAllowedOrigin(origin, corsOrigins) {
+		if !isAllowedOrigin(origin, corsOrigins, r.Host) {
 			writeDialectError(w, dialect, http.StatusForbidden, "Cross-origin request rejected", "forbidden_error")
 			return false
 		}
