@@ -11,6 +11,11 @@ data/*-jwt.json
 /zcode-gateway
 /zcode-gateway.exe
 /zcode-gateway-*
+/zgate
+/zgate.exe
+/zgate-*
+*.exe
+*.exe~
 
 # OS
 .DS_Store
