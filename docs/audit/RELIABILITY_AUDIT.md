@@ -95,7 +95,8 @@ Audit scope: commit `9e6279e` on branch `feature/security-hardening`. Verified v
 - **Location:** `internal/transport/transport.go:415-460`, `internal/accounts/accounts.go:490-530`
 - **Problem:** `accounts.Usable()` ordered accounts in strict failover order (default account always first, never round-robin), while `SendAnthropic` only enforced a global process lane (`ZCODE_LANE_WIDTH`). When `ZCODE_LANE_WIDTH > 1` (e.g. 4 or 8), all concurrent requests selected the same default account simultaneously, triggering upstream account-concurrency blocks (`429 code 3008`).
 - **Remediation (Phase 6.1, ADR 0002):** Implemented `accounts.AcquireCandidate` combining a per-account concurrency semaphore (`ZCODE_ACCOUNT_CONCURRENCY`, default `1`), least-in-flight sorting, and round-robin sequence tracking (`selectSeq`).
-- **Status:** **Fixed** in Phase 6.1. Verified by `TestLaneAndAccountConcurrencyBehavior`.
+- **Operational Limitation (Phase 7.1 HoL Audit):** When requests are pinned explicitly (`?account=a`) to an account that is already at its concurrency limit, the pinned request holds its acquired global lane slot while waiting for that account, blocking unpinned requests from entering the global lane even if other accounts are idle (`TestExtendedHeadOfLineBlockingWithPinnedRequestHoldingLane`). Unpinned routing is strongly recommended.
+- **Status:** **Fixed & Documented** in Phase 6.1 and Phase 7.1.
 
 ---
 

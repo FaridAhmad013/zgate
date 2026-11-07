@@ -1,0 +1,65 @@
+[Unit]
+Description=ZCode Gateway (Anthropic & OpenAI Compatible Proxy for ZCode Plan)
+Documentation=https://github.com/apissaj/zcode-gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zcode
+Group=zcode
+WorkingDirectory=/var/lib/zcode-gateway
+
+# Execution & Runtime Environment
+ExecStart=/usr/local/bin/zcode-gateway
+Restart=on-failure
+RestartSec=5s
+
+# Graceful Shutdown: SIGTERM triggers server.Shutdown(ctx) with drain window
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=20s
+
+# Storage & Directory Bindings
+StateDirectory=zcode-gateway
+StateDirectoryMode=0700
+Environment=ZCODE_ACCOUNTS_FILE=/var/lib/zcode-gateway/accounts.json
+Environment=BIND_HOST=127.0.0.1
+Environment=PORT=20131
+Environment=ZCODE_LANE_WIDTH=2
+Environment=ZCODE_ACCOUNT_CONCURRENCY=1
+Environment=ZCODE_RATE_LIMIT_RPS=20
+Environment=ZCODE_RATE_LIMIT_BURST=40
+
+# EnvironmentFile for production secrets (e.g. ZCODE_BRIDGE_TOKEN)
+# chmod 0600 /etc/zcode-gateway/zcode-gateway.env
+EnvironmentFile=-/etc/zcode-gateway/zcode-gateway.env
+
+# systemd-creds support (ADR 0001): Load encrypted credentials if configured
+# systemd-creds encrypt --name=bridge_token secret.txt /etc/credstore.encrypted/bridge_token
+# Sets $CREDENTIALS_DIRECTORY/bridge_token
+LoadCredential=-bridge_token:/etc/credstore/bridge_token
+LoadCredentialEncrypted=-bridge_token:/etc/credstore.encrypted/bridge_token
+
+# Hardened Linux Security Sandbox (systemd)
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+NoNewPrivileges=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

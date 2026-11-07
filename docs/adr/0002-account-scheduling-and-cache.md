@@ -72,12 +72,35 @@
 | **5. Cooldown Behavior** | Akun cooldown dilewati, namun setelah cooldown berakhir dapat menerima burst paralel jika `ZCODE_LANE_WIDTH > 1`. | Akun cooldown dilewati (`cooledDown(now)`), dan saat `MarkCooldown` dipanggil, `notifySlotWaitersLocked()` membangunkan waiter. Saat pulih, akun hanya menerima maksimal `ZCODE_ACCOUNT_CONCURRENCY` request aktif. |
 | **6. Token Refresh** | Dua request paralel yang memilih akun yang sama dapat memicu dua percobaan 401 bersamaan. | Dengan default `ZCODE_ACCOUNT_CONCURRENCY=1`, hanya 1 request yang memegang slot akun saat terjadi 401; jika `ZCODE_ACCOUNT_CONCURRENCY > 1`, `RefreshAccountSingleflight` tetap menggabungkan refresh per akun. |
 | **7. Upstream 3008 Handling** | Sering memicu `3008` karena gateway sendiri mengirim `>1` request paralel ke akun yang sama saat `ZCODE_LANE_WIDTH > jumlah_akun`. | Mencegah `3008` yang berasal dari gateway sendiri. `3008` hanya terjadi jika aplikasi eksternal (ZCode Desktop IDE) memakai akun yang sama di luar gateway, yang ditangani dengan rotasi instan (multi-akun) atau retry in-place (single-akun). |
-| **8. Deadlock Risk** | Rendah (tanpa kunci per akun). | **Nol (Bebas Deadlock secara struktural).** Urutan akuisisi selalu satu arah: `Global Lane (laneSem)` -> `Satu Account Slot (AcquireCandidate)`. Sebelum merotasi ke akun berikutnya pada saat error, slot akun pertama wajib dilepas (`releaseAcct()`). Tidak pernah memegang dua slot akun sekaligus. |
+| **8. Deadlock Risk** | Rendah (tanpa kunci per akun). | **Bebas circular-wait.** Akuisisi semaphore selalu satu arah (`Global Lane -> Satu Account Slot`), dan pelepasan dijamin oleh `sync.Once` pada `cancelBody.Close()` atau saat error. Namun, kebebasan deadlock tetap bergantung pada kebenaran penanganan context cancellation dan pelepasan body oleh caller. |
 | **9. Context Cancellation** | Hanya membatalkan di global lane atau HTTP call. | Baik `acquireLane(ctx)` maupun `AcquireCandidate(ctx, ...)` memilih `select { case <-waitCh: case <-ctx.Done(): }`, dan `cancelBody.Close()` melepas kedua semaphore via `sync.Once`. |
 
 ---
 
-## 3. Desain Optimasi Cache `accounts.json` & Strategi Invalidasi
+## 3. Pinned-Account Head-of-Line (HoL) Blocking & Panduan Operasional
+
+### 3.1 Skenario HoL Terbukti Secara Empiris (`TestExtendedHeadOfLineBlockingWithPinnedRequestHoldingLane`)
+Pada Phase 7.1, skenario HoL terbukti dapat direproduksi dengan konfigurasi:
+- `ZCODE_ACCOUNT_CONCURRENCY = 1` (Akun A & B)
+- `ZCODE_LANE_WIDTH = 2` (sama dengan jumlah akun)
+- Urutan request:
+  1. R1 menggunakan Akun A (stream panjang 120ms).
+  2. R2 di-pin ke Akun A (`?account=a`). R2 mengambil Global Lane Slot 2, tetapi terblokir di `AcquireCandidate` menunggu Akun A.
+  3. R3 bersifat unpinned (bisa memakai Akun A atau B). Akun B saat itu 100% idle (`inFlight == 0`).
+  4. Akibat R2 menahan Global Lane Slot 2, R3 tertahan di antrean global lane selama **`118.9 ms`** meskipun Akun B menganggur.
+
+### 3.2 Mengapa Opsi Alternatif Ditolak
+1. **Opsi B (Account Reservation -> Global Lane):** Ditolak karena memindahkan bottleneck. Request yang memesan akun akan menahan kapasitas akun tersebut saat mengantre di global lane, memblokir request lain yang memerlukan akun itu meski global lane sedang sibuk.
+2. **Opsi C (Coordinated Admission Scheduler):** Ditolak karena kompleksitas berlebih (centralized orchestrator goroutine, multiple channels per request, dan overhead CPU) yang bertentangan dengan prinsip stdlib minimalis dan keandalan dasar.
+
+### 3.3 Panduan Operasional Penjadwalan Akun
+- **Rekomendasi Utama (Unpinned Routing):** Gunakan routing tanpa pinning (`?account=` dikosongkan). Gateway akan mendistribusikan request secara otomatis menggunakan *Least-InFlight Round-Robin*, menjamin akun yang menganggur selalu dipilih lebih dahulu.
+- **Keterbatasan Pinning Akun:** Jika client harus menggunakan pinning akun (`?account=id`), pastikan konkurensi request untuk akun tersebut tidak melebihi `ZCODE_ACCOUNT_CONCURRENCY` agar tidak menahan slot lane global dari request akun lain.
+- **Klarifikasi Kapasitas:** Menyetel `ZCODE_LANE_WIDTH >= jumlah_akun * ZCODE_ACCOUNT_CONCURRENCY` **hanya** mengeliminasi HoL pada request unpinned; HoL tetap dapat terjadi jika ada request pinned ke akun yang jenuh.
+
+---
+
+## 4. Desain Optimasi Cache `accounts.json` & Strategi Invalidasi
 
 Untuk mengatasi bottleneck pembacaan disk (`os.ReadFile` + `json.Unmarshal`) pada `accounts.loadStore()` tanpa mengorbankan proteksi file korup (`SEC-04`) atau deteksi perubahan eksternal:
 

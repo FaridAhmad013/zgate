@@ -94,7 +94,7 @@
 
 ### 6.1 Hasil Simulasi Runtime Go (`GOMAXPROCS` & `debug.SetMemoryLimit`)
 
-> **PERINGATAN KUALIFIKASI:** Pengujian berikut dilakukan di mesin host Windows 11 menggunakan API internal runtime Go (`runtime.GOMAXPROCS` dan `debug.SetMemoryLimit`). Pengujian ini **BUKAN** benchmark kernel Linux dengan cgroup v2, batas memory CFS, atau virtualisasi KVM VPS. Hasil ini disajikan murni sebagai **proksi perilaku alokator memori dan scheduler Go saat dibatasi core dan target heap-nya**.
+> **PERINGATAN KUALIFIKASI TEGAS:** Pengujian berikut dilakukan di mesin host Windows 11 menggunakan API internal runtime Go (`runtime.GOMAXPROCS` dan `debug.SetMemoryLimit`). Pengujian ini **BUKAN** benchmark kernel Linux dengan cgroup v2, batas memory CFS, atau virtualisasi KVM VPS. Hasil ini disajikan murni sebagai **proksi perilaku alokator memori dan scheduler Go saat dibatasi core dan target heap-nya**. Angka-angka ini adalah **estimasi sementara** hingga pengujian Linux aktual dieksekusi di server VPS target.
 
 | Profil Simulasi Runtime | `GOMAXPROCS` | `SetMemoryLimit` | Idle Heap | Peak Heap Alloc | Median RPS (5 Runs) | Min / Max RPS | Total `p50` / `p95` | Queue `p50` / `p95` | Proc `p50` / `p95` | Error |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -110,6 +110,8 @@
 ## 7. Rekomendasi Konfigurasi Produksi Berdasarkan Hasil Pengukuran Aktual
 
 Karena implementasi Phase 6.1 telah melengkapi penjadwalan dengan **Per-Account Concurrency Semaphore (`ZCODE_ACCOUNT_CONCURRENCY`, default `1`)**, gateway secara otomatis membatasi jumlah request simultan per akun ke upstream dan mendistribusikan beban secara least-inFlight round-robin.
+
+**Peringatan Penting Mengenai HoL Blocking:** Menyetel `ZCODE_LANE_WIDTH >= jumlah_akun * ZCODE_ACCOUNT_CONCURRENCY` **hanya** mengeliminasi HoL pada request unpinned. Jika client melakukan pinning eksplisit (`?account=id`) ke akun yang sedang jenuh, request tersebut akan menahan satu slot lane global dan tetap memicu HoL bagi request lain (`TestExtendedHeadOfLineBlockingWithPinnedRequestHoldingLane`). Unpinned routing sangat disarankan untuk penggunaan produksi umum.
 
 ### 7.1 Local Developer (Laptop / PC Lokal)
 - **Karakteristik:** 1 pengguna, Claude Code / 9Router / SDK lokal, 1–2 akun ZCode.
