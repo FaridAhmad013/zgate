@@ -23,7 +23,10 @@ import (
 )
 
 // DefaultModel is the fallback when a request names no usable model.
-const DefaultModel = "glm-5.3-flash"
+const (
+	DefaultModel             = "glm-5.3-flash"
+	MaxSupportedOutputTokens = 131072
+)
 
 type staticModel struct {
 	ID              string `json:"id"`
@@ -103,6 +106,322 @@ func NormalizeModel(model string) string {
 		return lower
 	}
 	return DefaultModel
+}
+
+// ValidateRequest validates an incoming OpenAI or Anthropic inference payload
+// before forwarding to upstream.
+func ValidateRequest(body map[string]any, dialect string) error {
+	if body == nil {
+		return errors.New("request body must be a JSON object")
+	}
+	if err := validateModelField(body["model"]); err != nil {
+		return err
+	}
+	if err := validateMaxTokensField(body, "max_tokens"); err != nil {
+		return err
+	}
+	if err := validateMaxTokensField(body, "max_completion_tokens"); err != nil {
+		return err
+	}
+	if err := validateReasoningEffortField(body["reasoning_effort"]); err != nil {
+		return err
+	}
+	if err := validateThinkingField(body["thinking"]); err != nil {
+		return err
+	}
+	if err := validateToolsField(body["tools"], dialect); err != nil {
+		return err
+	}
+	if dialect != "openai" {
+		if err := validateAnthropicSystemField(body["system"]); err != nil {
+			return err
+		}
+	}
+	return validateMessagesField(body["messages"], dialect)
+}
+
+func validateModelField(raw any) error {
+	if raw == nil {
+		return nil
+	}
+	s, ok := raw.(string)
+	if !ok {
+		return errors.New("model must be a string")
+	}
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return errors.New("model must not be empty")
+	}
+	if strings.Contains(trimmed, "..") || strings.ContainsAny(trimmed, "/\\ \t\r\n") {
+		return errors.New("invalid model identifier")
+	}
+	lower := strings.ToLower(trimmed)
+	for _, suf := range []string{":low", ":high", ":max", ":medium"} {
+		if strings.HasSuffix(lower, suf) {
+			lower = lower[:len(lower)-len(suf)]
+			break
+		}
+	}
+	if !knownModels[lower] && !plausibleID.MatchString(lower) {
+		return errors.New("invalid model identifier")
+	}
+	return nil
+}
+
+func validateMaxTokensField(body map[string]any, key string) error {
+	raw, exists := body[key]
+	if !exists || raw == nil {
+		return nil
+	}
+	v, ok := raw.(float64)
+	if !ok || isNaN(v) || v < 1 || v > MaxSupportedOutputTokens || v != float64(int64(v)) {
+		return errors.New(key + " must be an integer between 1 and 131072")
+	}
+	return nil
+}
+
+func validateReasoningEffortField(raw any) error {
+	if raw == nil {
+		return nil
+	}
+	s, ok := raw.(string)
+	if !ok {
+		return errors.New("reasoning_effort must be a string")
+	}
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "low", "medium", "high", "max":
+		return nil
+	default:
+		return errors.New("reasoning_effort must be one of: low, medium, high, max")
+	}
+}
+
+func validateThinkingField(raw any) error {
+	if raw == nil {
+		return nil
+	}
+	th, ok := raw.(map[string]any)
+	if !ok {
+		return errors.New("thinking must be an object")
+	}
+	if typRaw, exists := th["type"]; exists && typRaw != nil {
+		typ, ok := typRaw.(string)
+		if !ok || (typ != "enabled" && typ != "disabled") {
+			return errors.New("thinking.type must be 'enabled' or 'disabled'")
+		}
+	}
+	if effRaw, exists := th["effort"]; exists && effRaw != nil {
+		if err := validateReasoningEffortField(effRaw); err != nil {
+			return errors.New("thinking.effort is invalid")
+		}
+	}
+	if budRaw, exists := th["budget_tokens"]; exists && budRaw != nil {
+		b, ok := budRaw.(float64)
+		if !ok || isNaN(b) || b < 1 || b > MaxSupportedOutputTokens {
+			return errors.New("thinking.budget_tokens must be between 1 and 131072")
+		}
+	}
+	return nil
+}
+
+func validateToolsField(raw any, dialect string) error {
+	if raw == nil {
+		return nil
+	}
+	tools, ok := raw.([]any)
+	if !ok {
+		return errors.New("tools must be an array")
+	}
+	for _, item := range tools {
+		tm, ok := item.(map[string]any)
+		if !ok {
+			return errors.New("each tool definition must be an object")
+		}
+		if dialect == "openai" || tm["type"] == "function" {
+			if tm["type"] != "function" {
+				return errors.New("tool.type must be 'function'")
+			}
+			fn, ok := tm["function"].(map[string]any)
+			if !ok {
+				return errors.New("tool.function must be an object")
+			}
+			name, ok := fn["name"].(string)
+			if !ok || strings.TrimSpace(name) == "" {
+				return errors.New("tool.function.name must be a non-empty string")
+			}
+			if params, exists := fn["parameters"]; exists && params != nil {
+				if _, ok := params.(map[string]any); !ok {
+					return errors.New("tool.function.parameters must be an object")
+				}
+			}
+		} else {
+			name, ok := tm["name"].(string)
+			if !ok || strings.TrimSpace(name) == "" {
+				return errors.New("tool.name must be a non-empty string")
+			}
+			if schema, exists := tm["input_schema"]; exists && schema != nil {
+				if _, ok := schema.(map[string]any); !ok {
+					return errors.New("tool.input_schema must be an object")
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func validateAnthropicSystemField(raw any) error {
+	if raw == nil {
+		return nil
+	}
+	switch v := raw.(type) {
+	case string:
+		return nil
+	case []any:
+		for _, item := range v {
+			switch b := item.(type) {
+			case string:
+			case map[string]any:
+				if _, ok := b["text"].(string); !ok {
+					return errors.New("system block text must be a string")
+				}
+			default:
+				return errors.New("invalid system block")
+			}
+		}
+		return nil
+	default:
+		return errors.New("system must be a string or array of content blocks")
+	}
+}
+
+func validateMessagesField(raw any, dialect string) error {
+	msgs, ok := raw.([]any)
+	if !ok {
+		return errors.New("messages must be a non-empty array")
+	}
+	if len(msgs) == 0 {
+		return errors.New("messages must not be empty")
+	}
+	nonSystemCount := 0
+	for _, item := range msgs {
+		msg, ok := item.(map[string]any)
+		if !ok {
+			return errors.New("each message must be an object")
+		}
+		role, ok := msg["role"].(string)
+		if !ok || strings.TrimSpace(role) == "" {
+			return errors.New("message.role must be a non-empty string")
+		}
+		if dialect == "openai" {
+			switch role {
+			case "system", "developer":
+			case "user", "assistant", "tool", "function":
+				nonSystemCount++
+			default:
+				return errors.New("invalid message role: " + role)
+			}
+		} else {
+			switch role {
+			case "user", "assistant":
+				nonSystemCount++
+			default:
+				return errors.New("invalid Anthropic message role: " + role)
+			}
+		}
+		if err := validateMessageContent(msg, role, dialect); err != nil {
+			return err
+		}
+	}
+	if nonSystemCount == 0 {
+		return errors.New("messages must contain at least one non-system turn")
+	}
+	return nil
+}
+
+func validateMessageContent(msg map[string]any, role, dialect string) error {
+	content, hasContent := msg["content"]
+	if role == "assistant" {
+		if callsRaw, hasCalls := msg["tool_calls"]; hasCalls && callsRaw != nil {
+			calls, ok := callsRaw.([]any)
+			if !ok {
+				return errors.New("assistant tool_calls must be an array")
+			}
+			for _, c := range calls {
+				cm, ok := c.(map[string]any)
+				if !ok || cm["type"] != "function" {
+					return errors.New("invalid assistant tool_call entry")
+				}
+				fn, ok := cm["function"].(map[string]any)
+				if !ok {
+					return errors.New("assistant tool_call.function must be an object")
+				}
+				if name, _ := fn["name"].(string); strings.TrimSpace(name) == "" {
+					return errors.New("assistant tool_call.function.name is required")
+				}
+			}
+			if content == nil {
+				return nil
+			}
+		}
+	}
+	if !hasContent || content == nil {
+		return errors.New("message.content is required")
+	}
+	switch c := content.(type) {
+	case string:
+		return nil
+	case []any:
+		for _, part := range c {
+			pm, ok := part.(map[string]any)
+			if !ok {
+				return errors.New("each message content block must be an object")
+			}
+			typ, ok := pm["type"].(string)
+			if !ok || strings.TrimSpace(typ) == "" {
+				return errors.New("content block type must be a non-empty string")
+			}
+			if typ == "image_url" {
+				iu, ok := pm["image_url"].(map[string]any)
+				if !ok {
+					return errors.New("image_url block must be an object")
+				}
+				u, _ := iu["url"].(string)
+				u = strings.TrimSpace(u)
+				if u == "" {
+					return errors.New("image_url.url must not be empty")
+				}
+				if _, _, isData := parseDataURL(u); !isData {
+					if _, err := ValidateImageURL(u); err != nil {
+						return err
+					}
+				}
+			} else if typ == "image" && dialect != "openai" {
+				src, ok := pm["source"].(map[string]any)
+				if !ok {
+					return errors.New("image.source must be an object")
+				}
+				srcType, _ := src["type"].(string)
+				switch srcType {
+				case "url":
+					u, _ := src["url"].(string)
+					if _, err := ValidateImageURL(u); err != nil {
+						return err
+					}
+				case "base64":
+					mt, _ := src["media_type"].(string)
+					data, _ := src["data"].(string)
+					if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(mt)), "image/") || strings.TrimSpace(data) == "" {
+						return errors.New("invalid base64 image source")
+					}
+				default:
+					return errors.New("unsupported image.source.type")
+				}
+			}
+		}
+		return nil
+	default:
+		return errors.New("message.content must be a string or array of content blocks")
+	}
 }
 
 // ListModels is the static catalogue fallback (billing unreachable).

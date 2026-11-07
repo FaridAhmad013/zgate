@@ -14,6 +14,7 @@ import (
 	"github.com/apissaj/zcode-gateway/internal/accounts"
 	"github.com/apissaj/zcode-gateway/internal/auth"
 	"github.com/apissaj/zcode-gateway/internal/identity"
+	"github.com/apissaj/zcode-gateway/internal/models"
 	"github.com/apissaj/zcode-gateway/internal/quota"
 	"github.com/apissaj/zcode-gateway/internal/transport"
 )
@@ -121,6 +122,10 @@ func handlePost(w http.ResponseWriter, r *http.Request, accountID, dialect strin
 	body, ok := parseJSON(raw)
 	if !ok {
 		writeDialectError(w, dialect, http.StatusBadRequest, "Invalid JSON body", "invalid_request_error")
+		return
+	}
+	if err := models.ValidateRequest(body, dialect); err != nil {
+		writeDialectError(w, dialect, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
 	}
 	handler(w, r, body, accountID)
