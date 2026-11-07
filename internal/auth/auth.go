@@ -50,7 +50,7 @@ type AuthError struct {
 	Kind   string // auth | config | cancelled | expired | rejected | protocol | refresh
 }
 
-func (e *AuthError) Error() string { return e.Msg }
+func (e *AuthError) Error() string { return Redact(e.Msg) }
 
 // DecodeJWT parses a JWT's payload claims without verifying the signature.
 func DecodeJWT(token string) (map[string]any, bool) {
@@ -111,7 +111,7 @@ func StartDeviceFlow(ctx context.Context) (*DeviceFlow, error) {
 	}
 	body, status, err := doRequest(req)
 	if err != nil {
-		return nil, &AuthError{Msg: "device flow init: " + err.Error(), Kind: "auth"}
+		return nil, &AuthError{Msg: "device flow init: " + RedactSecrets(err.Error(), hexEncode(pollToken)), Kind: "auth"}
 	}
 	var out struct {
 		Data struct {
@@ -125,10 +125,10 @@ func StartDeviceFlow(ctx context.Context) (*DeviceFlow, error) {
 		Msg  string `json:"msg"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
-		return nil, &AuthError{Msg: "device flow init: non-JSON reply", Status: status, Body: string(body), Kind: "protocol"}
+		return nil, &AuthError{Msg: "device flow init: non-JSON reply", Status: status, Kind: "protocol"}
 	}
 	if status < 200 || status >= 300 || out.Data.FlowID == "" || out.Data.AuthorizeURL == "" {
-		return nil, &AuthError{Msg: fmt.Sprintf("device flow init failed (HTTP %d) %s", status, out.Msg), Status: status, Body: string(body), Kind: "auth"}
+		return nil, &AuthError{Msg: fmt.Sprintf("device flow init failed (HTTP %d) %s", status, Redact(out.Msg)), Status: status, Kind: "auth"}
 	}
 	exp := time.Now().Add(5 * time.Minute)
 	switch v := out.Data.ExpiresAt.(type) {
@@ -186,7 +186,7 @@ func PollDeviceFlow(ctx context.Context, flow *DeviceFlow) (*FlowResult, error) 
 		}
 		body, status, err := doRequest(req)
 		if err != nil {
-			return nil, &AuthError{Msg: "device flow poll: " + err.Error(), Status: status, Kind: "auth"}
+			return nil, &AuthError{Msg: "device flow poll: " + RedactSecrets(err.Error(), flow.PollToken), Status: status, Kind: "auth"}
 		}
 		var out struct {
 			Data struct {
@@ -198,12 +198,12 @@ func PollDeviceFlow(ctx context.Context, flow *DeviceFlow) (*FlowResult, error) 
 			} `json:"data"`
 		}
 		if err := json.Unmarshal(body, &out); err != nil || out.Data.Status == "" {
-			return nil, &AuthError{Msg: "device flow poll: parse failed", Status: status, Body: string(body), Kind: "protocol"}
+			return nil, &AuthError{Msg: "device flow poll: parse failed", Status: status, Kind: "protocol"}
 		}
 		switch out.Data.Status {
 		case "ready":
 			if out.Data.Token == "" {
-				return nil, &AuthError{Msg: "device flow returned no plan token", Kind: "protocol", Body: string(body)}
+				return nil, &AuthError{Msg: "device flow returned no plan token", Kind: "protocol"}
 			}
 			res := &FlowResult{JWT: out.Data.Token, User: out.Data.User}
 			if out.Data.Zai != nil {
@@ -213,7 +213,7 @@ func PollDeviceFlow(ctx context.Context, flow *DeviceFlow) (*FlowResult, error) 
 			}
 			return res, nil
 		case "failed":
-			return nil, &AuthError{Msg: "device flow was rejected", Kind: "rejected", Body: string(body)}
+			return nil, &AuthError{Msg: "device flow was rejected", Kind: "rejected"}
 		case "expired":
 			return nil, &AuthError{Msg: "device flow expired before approval", Kind: "expired"}
 		}
@@ -246,18 +246,18 @@ func RefreshPlanJWT(ctx context.Context, refreshToken string) (*FlowResult, erro
 	}
 	body, status, err := doRequest(req)
 	if err != nil {
-		return nil, &AuthError{Msg: "refresh request failed: " + err.Error(), Status: status, Kind: "refresh"}
+		return nil, &AuthError{Msg: "refresh request failed: " + RedactSecrets(err.Error(), refreshToken), Status: status, Kind: "refresh"}
 	}
 	var out struct {
 		Data struct {
-			Token string       `json:"token"`
+			Token string         `json:"token"`
 			User  map[string]any `json:"user"`
-			Zai   *oauthTokens `json:"zai"`
-			Big   *oauthTokens `json:"bigmodel"`
+			Zai   *oauthTokens   `json:"zai"`
+			Big   *oauthTokens   `json:"bigmodel"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil || status < 200 || status >= 300 || out.Data.Token == "" {
-		return nil, &AuthError{Msg: "plan token refresh rejected (re-login required)", Status: status, Body: string(body), Kind: "refresh"}
+		return nil, &AuthError{Msg: "plan token refresh rejected (re-login required)", Status: status, Kind: "refresh"}
 	}
 	res := &FlowResult{JWT: out.Data.Token, User: out.Data.User, RefreshToken: refreshToken}
 	if out.Data.Zai != nil {

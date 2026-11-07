@@ -33,9 +33,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
-	"os"
 	"sync"
 	"time"
 
@@ -61,7 +61,7 @@ type UpstreamError struct {
 	AccountSwitch bool   // internal: rotation may continue with another account
 }
 
-func (e *UpstreamError) Error() string { return e.Msg }
+func (e *UpstreamError) Error() string { return auth.Redact(e.Msg) }
 
 func envOr(key, fallback string) string {
 	if v := strings.TrimSpace(osGetenv(key)); v != "" {
@@ -82,9 +82,13 @@ func errorFromResponse(status int, body []byte) *UpstreamError {
 		} `json:"error"`
 		Raw string `json:"-"`
 	}
-	text := string(body)
+	text := auth.Redact(string(body))
 	if json.Unmarshal(body, &env) != nil {
 		env.Raw = text
+	}
+	env.Msg = auth.Redact(env.Msg)
+	if env.Error != nil {
+		env.Error.Message = auth.Redact(env.Error.Message)
 	}
 	code := env.Code
 	message := ""
@@ -106,7 +110,7 @@ func errorFromResponse(status int, body []byte) *UpstreamError {
 			message = fmt.Sprintf("upstream %d", status)
 		}
 	}
-	return &UpstreamError{Msg: message, Status: status, Body: env, Kind: "upstream", Code: code}
+	return &UpstreamError{Msg: auth.Redact(message), Status: status, Body: env, Kind: "upstream", Code: code}
 }
 
 func msgSuffix(msg string) string {
@@ -532,7 +536,7 @@ func attemptOnce(ctx context.Context, client *http.Client, acct candidate, beare
 		if callCtx.Err() != nil && ctx.Err() == nil {
 			return nil, &UpstreamError{Msg: "upstream timeout", Status: 504, Kind: "upstream"}
 		}
-		return nil, &UpstreamError{Msg: "upstream fetch failed: " + err.Error(), Status: 502, Kind: "upstream"}
+		return nil, &UpstreamError{Msg: "upstream fetch failed: " + auth.RedactSecrets(err.Error(), bearer), Status: 502, Kind: "upstream"}
 	}
 	resp.Body = &cancelBody{ReadCloser: resp.Body, cancel: cancel}
 	return resp, nil
