@@ -6,6 +6,8 @@ data/*-jwt.json
 **/data/
 *.jwt
 .env
+bridge_token.txt
+**/bridge_token.txt
 
 # Build output
 /zcode-gateway

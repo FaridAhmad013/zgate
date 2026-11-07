@@ -2,11 +2,13 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
 	_ "embed"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -227,10 +229,15 @@ func handleDashboardStatus(w http.ResponseWriter, r *http.Request) {
 		quotaViews = append(quotaViews, view)
 	}
 
+	token := c.BridgeToken
+	if token == "" {
+		token = resolvePersistentBridgeToken()
+	}
+
 	sendJSON(w, http.StatusOK, map[string]any{
 		"ok":          true,
 		"auth":        authMode,
-		"bridgeToken": c.BridgeToken,
+		"bridgeToken": token,
 		"laneWidth":   laneWidth,
 		"accounts":    quotaViews,
 		"logs":        logsCopy,
@@ -347,6 +354,30 @@ func handleDashboardAccountDefault(w http.ResponseWriter, r *http.Request) {
 	sendJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+func resolvePersistentBridgeToken() string {
+	tokenFile := filepath.Join(filepath.Dir(accounts.AccountsFile()), "bridge_token.txt")
+	if raw, err := os.ReadFile(tokenFile); err == nil {
+		return strings.TrimSpace(string(raw))
+	}
+	return ""
+}
+
+func generateAndStoreBridgeToken() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("failed to generate entropy: %w", err)
+	}
+	tok := fmt.Sprintf("sk-zgate-%x", b[:])
+	tokenFile := filepath.Join(filepath.Dir(accounts.AccountsFile()), "bridge_token.txt")
+	if err := os.WriteFile(tokenFile, []byte(tok), 0600); err != nil {
+		return "", fmt.Errorf("failed to save token: %w", err)
+	}
+	cfgMu.Lock()
+	cfg.BridgeToken = tok
+	cfgMu.Unlock()
+	return tok, nil
+}
+
 func handleDashboardAccountRemove(w http.ResponseWriter, r *http.Request) {
 	if !isDashboardAuthorized(r) {
 		sendJSON(w, http.StatusUnauthorized, map[string]any{"ok": false, "error": "Authentication required"})
@@ -358,3 +389,17 @@ func handleDashboardAccountRemove(w http.ResponseWriter, r *http.Request) {
 	}
 	sendJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
+
+func handleDashboardTokenGenerate(w http.ResponseWriter, r *http.Request) {
+	if !isDashboardAuthorized(r) {
+		sendJSON(w, http.StatusUnauthorized, map[string]any{"ok": false, "error": "Authentication required"})
+		return
+	}
+	newToken, err := generateAndStoreBridgeToken()
+	if err != nil {
+		sendJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	sendJSON(w, http.StatusOK, map[string]any{"ok": true, "token": newToken})
+}
+

@@ -85,7 +85,7 @@ func TestValidateConfigAndBindHostPrecedence(t *testing.T) {
 
 func TestMainFailsStartupOnPublicBindWithoutToken(t *testing.T) {
 	cmd := exec.Command("go", "run", "../../cmd/zcode-gateway")
-	cmd.Env = append(os.Environ(), "BIND_HOST=0.0.0.0", "ZCODE_BRIDGE_TOKEN=")
+	cmd.Env = append(os.Environ(), "BIND_HOST=0.0.0.0", "ZCODE_BRIDGE_TOKEN=", "CREDENTIALS_DIRECTORY=")
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		t.Fatalf("expected binary to exit non-zero on BIND_HOST=0.0.0.0 without token, output: %s", string(out))

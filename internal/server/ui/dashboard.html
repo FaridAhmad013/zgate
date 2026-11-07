@@ -887,6 +887,7 @@
                     <div style="display:flex; gap:6px;">
                       <button class="btn-mini" onclick="toggleTokenVisibility()">VIEW</button>
                       <button class="btn-mini" onclick="copyBridgeTokenOnly()">COPY</button>
+                      <button class="btn-mini" id="genTokenBtn" onclick="generateApiKey()">GENERATE KEY</button>
                     </div>
                   </div>
                 </div>
@@ -1120,7 +1121,14 @@
 
         actualBridgeToken = data.bridgeToken || '';
         const tokenInput = document.getElementById('bridgeTokenField');
-        tokenInput.value = actualBridgeToken || 'dummy-key';
+        const genBtn = document.getElementById('genTokenBtn');
+        if (actualBridgeToken) {
+          tokenInput.value = actualBridgeToken;
+          if (genBtn) genBtn.textContent = 'REGENERATE';
+        } else {
+          tokenInput.value = 'NO API KEY GENERATED';
+          if (genBtn) genBtn.textContent = 'GENERATE KEY';
+        }
 
         renderAccounts(data.accounts || []);
         renderLogs(data.logs || []);
@@ -1134,8 +1142,35 @@
       field.type = field.type === 'password' ? 'text' : 'password';
     }
 
+    async function generateApiKey() {
+      if (actualBridgeToken && !confirm('Regenerate API key? Existing clients using the old key will need to be updated.')) {
+        return;
+      }
+      try {
+        const res = await fetch('/api/dashboard/token/generate', { method: 'POST' });
+        const data = await res.json();
+        if (data.ok && data.token) {
+          actualBridgeToken = data.token;
+          const tokenInput = document.getElementById('bridgeTokenField');
+          tokenInput.value = data.token;
+          tokenInput.type = 'text';
+          const genBtn = document.getElementById('genTokenBtn');
+          if (genBtn) genBtn.textContent = 'REGENERATE';
+          showToast('NEW API KEY GENERATED');
+        } else {
+          showToast('FAILED TO GENERATE API KEY');
+        }
+      } catch (e) {
+        showToast('NETWORK ERROR');
+      }
+    }
+
     function copyBridgeTokenOnly() {
-      const val = actualBridgeToken || document.getElementById('bridgeTokenField').value || 'dummy-key';
+      const val = actualBridgeToken || document.getElementById('bridgeTokenField').value;
+      if (!val || val === 'NO API KEY GENERATED') {
+        showToast('PLEASE CLICK GENERATE KEY FIRST');
+        return;
+      }
       navigator.clipboard.writeText(val);
       showToast('API KEY COPIED TO CLIPBOARD');
     }

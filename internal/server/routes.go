@@ -385,6 +385,8 @@ func route(origW http.ResponseWriter, r *http.Request) {
 		handleDashboardAccountDefault(w, r)
 	case r.Method == http.MethodPost && pathName == "/api/dashboard/account/remove":
 		handleDashboardAccountRemove(w, r)
+	case r.Method == http.MethodPost && pathName == "/api/dashboard/token/generate":
+		handleDashboardTokenGenerate(w, r)
 	case r.Method == http.MethodGet && pathName == "/healthz":
 		sendJSON(w, http.StatusOK, map[string]any{"ok": true})
 	case r.Method == http.MethodGet && pathName == "/health":

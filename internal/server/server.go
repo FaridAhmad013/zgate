@@ -148,8 +148,9 @@ func ValidateConfig(c Config) error {
 	if c.Port < 0 || c.Port > 65535 {
 		return fmt.Errorf("invalid port %d", c.Port)
 	}
-	if !IsLoopbackHost(c.Host) && strings.TrimSpace(c.BridgeToken) == "" {
-		return fmt.Errorf("refusing to bind non-loopback host %q without ZCODE_BRIDGE_TOKEN", c.Host)
+	adminKey := strings.TrimSpace(os.Getenv("GATEWAY_ADMIN_KEY"))
+	if !IsLoopbackHost(c.Host) && strings.TrimSpace(c.BridgeToken) == "" && adminKey == "" {
+		return fmt.Errorf("refusing to bind non-loopback host %q without ZCODE_BRIDGE_TOKEN or GATEWAY_ADMIN_KEY", c.Host)
 	}
 	return nil
 }
@@ -233,6 +234,12 @@ func constantTimeTokenEqual(presented, expected string) bool {
 
 func authorized(r *http.Request) bool {
 	expected := strings.TrimSpace(getConfig().BridgeToken)
+	if expected == "" {
+		expected = resolvePersistentBridgeToken()
+	}
+	if expected == "" {
+		expected = resolveAdminKey()
+	}
 	if expected == "" {
 		return IsLoopbackHost(getConfig().Host)
 	}
