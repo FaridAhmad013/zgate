@@ -3,333 +3,1027 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>ZGate Dashboard</title>
+  <title>ZGate — AI Gateway Proxy</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
   <style>
+    /* ==========================================================================
+       WARM HARDWARE SYNTH (TEENAGE ENGINEERING / BRAUN INDUSTRIAL)
+       Anodized warm charcoal chassis, recessed LED screens, tactile keycaps,
+       and International Orange (#ff5500) functional accents.
+       ========================================================================== */
     :root {
-      --bg-base: #070b14;
-      --bg-surface: #0f172a;
-      --bg-surface-elevated: #1e293b;
-      --border-card: #334155;
-      --text-primary: #f1f5f9;
-      --text-muted: #94a3b8;
-      --accent-primary: #38bdf8;
-      --accent-hover: #0ea5e9;
-      --accent-glow: rgba(56, 189, 248, 0.25);
-      --success: #10b981;
-      --warning: #f59e0b;
-      --danger: #ef4444;
-      --code-bg: #030712;
-      --card-radius: 14px;
-      --sidebar-width: 230px;
+      --bg-chassis: #141413;
+      --bg-module: #1c1c1a;
+      --bg-elevated: #252522;
+      --bg-screen: #0b0c0b;
+      --border-groove: #0a0a09;
+      --border-bevel: #33332f;
+      --border-strong: #4a4a44;
+      --text-main: #ebebe6;
+      --text-muted: #9e9e93;
+      --text-dim: #66665e;
+      --orange: #ff5500;
+      --orange-hi: #ff6a1a;
+      --orange-shadow: #993300;
+      --led-green: #00e676;
+      --led-amber: #ffab00;
+      --led-red: #ff1744;
+      --font-ui: 'Space Grotesk', -apple-system, sans-serif;
+      --font-mono: 'JetBrains Mono', monospace;
+      --radius: 3px;
     }
-    * { box-sizing: border-box; margin: 0; padding: 0; font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-    body { background-color: var(--bg-base); color: var(--text-primary); height: 100vh; overflow: hidden; display: flex; -webkit-font-smoothing: antialiased; }
-    
-    /* Layout */
-    .app-sidebar { width: var(--sidebar-width); background: var(--bg-surface); border-right: 1px solid var(--border-card); display: flex; flex-direction: column; flex-shrink: 0; }
-    .app-content { flex: 1; display: flex; flex-direction: column; overflow: hidden; background: var(--bg-base); }
-    .app-topbar { height: 60px; border-bottom: 1px solid var(--border-card); background: rgba(15, 23, 42, 0.95); display: flex; align-items: center; justify-content: space-between; padding: 0 24px; backdrop-filter: blur(8px); }
-    .main-scroll { flex: 1; overflow-y: auto; padding: 24px; }
 
-    /* Brand & Icons */
-    .icon { width: 16px; height: 16px; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; fill: none; display: inline-block; vertical-align: middle; }
-    .brand { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 15px; color: #fff; padding: 18px; border-bottom: 1px solid var(--border-card); }
-    .brand-logo { width: 28px; height: 28px; border-radius: 8px; background: linear-gradient(135deg, #0ea5e9 0%, #38bdf8 100%); display: flex; align-items: center; justify-content: center; color: #fff; box-shadow: 0 0 14px var(--accent-glow); }
-    
-    /* Badges */
-    .badge { font-size: 11px; padding: 2px 8px; border-radius: 9999px; background: rgba(56, 189, 248, 0.12); color: var(--accent-primary); border: 1px solid rgba(56, 189, 248, 0.3); font-weight: 500; display: inline-flex; align-items: center; gap: 5px; }
-    .badge-success { background: rgba(16, 185, 129, 0.12); color: #34d399; border-color: rgba(16, 185, 129, 0.3); }
-    .badge-neutral { background: rgba(148, 163, 184, 0.1); color: #94a3b8; border: 1px solid rgba(148, 163, 184, 0.2); }
-    .badge-default { background: rgba(56, 189, 248, 0.15); color: var(--accent-primary); border: 1px solid rgba(56, 189, 248, 0.3); font-size: 10px; padding: 1px 6px; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
 
-    /* Nav Links */
-    .nav-list { list-style: none; padding: 14px 10px; flex: 1; }
-    .nav-item { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 8px; color: var(--text-muted); text-decoration: none; font-size: 13px; font-weight: 500; cursor: pointer; transition: all 0.2s ease; margin-bottom: 4px; }
-    .nav-item:hover, .nav-item.active { background: var(--bg-surface-elevated); color: #fff; }
-    .nav-item.active { border-left: 3px solid var(--accent-primary); border-radius: 0 8px 8px 0; }
+    body {
+      background-color: var(--bg-chassis);
+      background-image: radial-gradient(#252522 1px, transparent 1px);
+      background-size: 16px 16px;
+      color: var(--text-main);
+      font-family: var(--font-ui);
+      height: 100vh;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      -webkit-font-smoothing: antialiased;
+      font-size: 13px;
+    }
 
-    /* Daemon Card in Sidebar */
-    .sidebar-footer { padding: 16px; border-top: 1px solid var(--border-card); }
-    .daemon-card { background: rgba(30, 41, 59, 0.5); border: 1px solid var(--border-card); border-radius: 10px; padding: 12px; }
-    .daemon-status { display: flex; align-items: center; justify-content: space-between; font-size: 12px; margin-bottom: 6px; }
-    .dot-online { width: 8px; height: 8px; border-radius: 50%; background: var(--success); display: inline-block; box-shadow: 0 0 10px var(--success); }
+    /* ==========================================================================
+       MAIN APPLICATION SHELL
+       ========================================================================== */
+    .app-shell {
+      flex: 1;
+      display: flex;
+      overflow: hidden;
+    }
 
-    /* Bento Cards (Portfolio Theme) */
-    .grid { display: grid; grid-template-columns: 1fr; gap: 20px; }
-    @media (min-width: 900px) { .grid-2 { grid-template-columns: 1fr 1fr; } }
-    .card { background: var(--bg-surface); border: 1px solid var(--border-card); border-radius: var(--card-radius); padding: 20px; box-shadow: 0 4px 12px -2px rgba(0, 0, 0, 0.25); transition: border-color 0.2s ease; }
-    .card:hover { border-color: rgba(56, 189, 248, 0.4); }
-    .card-title { font-size: 14px; font-weight: 600; color: #fff; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; }
+    /* Sidebar Chassis */
+    .app-sidebar {
+      width: 230px;
+      background: var(--bg-module);
+      border-right: 2px solid var(--border-groove);
+      box-shadow: inset -1px 0 0 var(--border-bevel);
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+      user-select: none;
+    }
 
-    /* Buttons & Interactive */
-    .btn { background: var(--accent-primary); color: #070b14; border: none; border-radius: 8px; padding: 8px 14px; font-size: 13px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 8px; transition: all 0.2s ease; }
-    .btn:hover { background: var(--accent-hover); box-shadow: 0 0 14px var(--accent-glow); }
-    .btn-secondary { background: var(--bg-surface-elevated); border: 1px solid var(--border-card); color: var(--text-primary); font-weight: 500; }
-    .btn-secondary:hover { background: #334155; border-color: #475569; }
-    .btn-ghost-danger { background: rgba(239, 68, 68, 0.06); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.25); border-radius: 6px; cursor: pointer; padding: 4px 8px; font-size: 11px; transition: all 0.2s ease; }
-    .btn-ghost-danger:hover { background: rgba(239, 68, 68, 0.16); border-color: rgba(239, 68, 68, 0.45); color: #ef4444; }
-    .input { background: var(--code-bg); border: 1px solid var(--border-card); border-radius: 8px; padding: 9px 12px; color: #fff; width: 100%; font-size: 13px; outline: none; margin-bottom: 12px; }
-    .input:focus { border-color: var(--accent-primary); box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.15); }
+    .brand {
+      height: 58px;
+      padding: 0 18px;
+      border-bottom: 2px solid var(--border-groove);
+      box-shadow: 0 1px 0 var(--border-bevel);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
 
-    /* Config & Inputs */
-    .config-code { font-family: "JetBrains Mono", monospace; font-size: 12px; color: #bae6fd; background: var(--code-bg); padding: 7px 12px; border-radius: 6px; border: 1px solid var(--border-card); }
-    .token-input-wrap { display: flex; align-items: center; background: var(--code-bg); border: 1px solid var(--border-card); border-radius: 6px; padding: 2px 8px; }
-    .token-field { flex: 1; border: none; background: transparent; color: #bae6fd; font-family: "JetBrains Mono", monospace; font-size: 12px; outline: none; padding: 6px 4px; }
-    .icon-btn { background: transparent; border: none; color: var(--text-muted); cursor: pointer; padding: 4px; display: inline-flex; align-items: center; border-radius: 4px; }
-    .icon-btn:hover { color: #fff; background: rgba(255, 255, 255, 0.08); }
+    .brand-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
 
-    /* Table */
-    table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    th { text-align: left; padding: 10px 12px; color: var(--text-muted); border-bottom: 1px solid var(--border-card); font-weight: 500; }
-    td { padding: 12px; border-bottom: 1px solid var(--border-card); vertical-align: middle; }
+    .brand-mark {
+      width: 22px;
+      height: 22px;
+      background: var(--orange);
+      color: #ffffff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: var(--font-mono);
+      font-weight: 700;
+      font-size: 12px;
+      border-radius: 2px;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.35), 0 2px 0 var(--border-groove);
+    }
 
-    /* Quota Progress Bar */
-    .progress-track { width: 100%; max-width: 140px; height: 6px; background: rgba(51, 65, 85, 0.6); border-radius: 9999px; overflow: hidden; margin-top: 4px; }
-    .progress-fill { height: 100%; background: linear-gradient(90deg, #38bdf8 0%, #0ea5e9 100%); border-radius: 9999px; transition: width 0.3s ease; }
+    .brand-title-wrap {
+      display: flex;
+      flex-direction: column;
+    }
 
-    /* Console Logs */
-    .console-box { background: var(--code-bg); border: 1px solid var(--border-card); border-radius: 8px; font-family: "JetBrains Mono", monospace; font-size: 12px; padding: 12px; max-height: 140px; overflow-y: auto; color: #94a3b8; line-height: 1.8; }
-    .log-line { display: flex; gap: 12px; }
-    .log-time { color: #64748b; flex-shrink: 0; }
-    .log-status-200 { color: #34d399; }
-    .log-status-400 { color: #fbbf24; }
-    .log-status-500 { color: #f87171; }
+    .brand-name {
+      font-weight: 700;
+      font-size: 15px;
+      letter-spacing: 0.02em;
+      line-height: 1.1;
+      text-transform: uppercase;
+    }
 
-    /* Modal Backdrop & Box */
-    .modal-backdrop { display: none; background: rgba(7, 11, 20, 0.85); backdrop-filter: blur(6px); position: fixed; inset: 0; align-items: center; justify-content: center; z-index: 100; }
+    .brand-sub {
+      font-family: var(--font-mono);
+      font-size: 9px;
+      color: var(--text-muted);
+      letter-spacing: 0.08em;
+    }
+
+    .brand-ver {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: var(--text-muted);
+      background: var(--bg-screen);
+      border: 1px solid var(--border-bevel);
+      padding: 2px 6px;
+      border-radius: 2px;
+    }
+
+    .nav-section-label {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--text-dim);
+      padding: 18px 18px 8px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .nav-list {
+      list-style: none;
+      padding: 0 12px;
+      flex: 1;
+    }
+
+    /* Hardware Selector Buttons */
+    .nav-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 12px;
+      border-radius: var(--radius);
+      color: var(--text-muted);
+      font-size: 12.5px;
+      font-weight: 600;
+      cursor: pointer;
+      margin-bottom: 6px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border-bevel);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 2px 0 var(--border-groove);
+      transition: all 0.1s ease;
+    }
+
+    .nav-item-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .nav-led {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--border-groove);
+      box-shadow: inset 0 1px 1px rgba(0,0,0,0.8);
+    }
+
+    .nav-item:hover {
+      color: var(--text-main);
+      border-color: var(--border-strong);
+    }
+
+    .nav-item:active {
+      transform: translateY(1px);
+      box-shadow: 0 1px 0 var(--border-groove);
+    }
+
+    .nav-item.active {
+      color: var(--text-main);
+      background: #2c2c28;
+      border-color: var(--orange);
+    }
+
+    .nav-item.active .nav-led {
+      background: var(--orange);
+      box-shadow: 0 0 6px var(--orange);
+    }
+
+    .nav-kbd {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: var(--text-dim);
+    }
+
+    /* Sidebar Recessed LCD Footer */
+    .sidebar-footer {
+      padding: 14px;
+      border-top: 2px solid var(--border-groove);
+      box-shadow: inset 0 1px 0 var(--border-bevel);
+      background: var(--bg-module);
+    }
+
+    .lcd-bay {
+      background: var(--bg-screen);
+      border: 1px solid var(--border-bevel);
+      box-shadow: inset 0 2px 6px rgba(0,0,0,0.85);
+      border-radius: 2px;
+      padding: 10px 12px;
+      font-family: var(--font-mono);
+    }
+
+    .daemon-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 10.5px;
+      margin-bottom: 6px;
+    }
+
+    .status-led {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--led-green);
+      font-weight: 600;
+    }
+
+    .led-dot {
+      width: 6px;
+      height: 6px;
+      background: var(--led-green);
+      border-radius: 50%;
+      display: inline-block;
+      box-shadow: 0 0 6px var(--led-green);
+    }
+
+    /* Content Area */
+    .app-content {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* Topbar - Recessed Hardware Telemetry Strip */
+    .app-topbar {
+      height: 58px;
+      border-bottom: 2px solid var(--border-groove);
+      box-shadow: 0 1px 0 var(--border-bevel);
+      background: var(--bg-module);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 24px;
+      gap: 12px;
+    }
+
+    .telemetry-screen {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      background: var(--bg-screen);
+      border: 1px solid var(--border-bevel);
+      box-shadow: inset 0 2px 5px rgba(0,0,0,0.8);
+      padding: 7px 14px;
+      border-radius: 2px;
+      overflow-x: auto;
+    }
+
+    .telemetry-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      white-space: nowrap;
+    }
+
+    .telemetry-key {
+      color: var(--text-dim);
+      font-size: 10px;
+    }
+
+    .telemetry-val {
+      color: var(--text-main);
+      font-weight: 600;
+    }
+
+    .telemetry-sep {
+      color: var(--border-bevel);
+    }
+
+    /* Main Scrollable Canvas */
+    .main-scroll {
+      flex: 1;
+      overflow-y: auto;
+      padding: 24px;
+    }
+
+    /* ==========================================================================
+       HARDWARE MODULES (CARDS) & GRIDS
+       ========================================================================== */
+    .grid-2 {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 20px;
+      margin-bottom: 20px;
+    }
+
+    @media (min-width: 980px) {
+      .grid-2 {
+        grid-template-columns: 1.12fr 0.88fr;
+      }
+    }
+
+    .card {
+      background: var(--bg-module);
+      border: 1px solid var(--border-bevel);
+      border-radius: var(--radius);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.05), 0 4px 0 var(--border-groove), 0 6px 14px rgba(0,0,0,0.45);
+      margin-bottom: 22px;
+      overflow: hidden;
+    }
+
+    .grid-2 .card {
+      margin-bottom: 0;
+    }
+
+    .card-header {
+      padding: 11px 16px;
+      border-bottom: 2px solid var(--border-groove);
+      box-shadow: 0 1px 0 var(--border-bevel);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: var(--bg-elevated);
+    }
+
+    .card-title-group {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    /* Industrial Chassis Screw Graphic */
+    .screw {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #141413;
+      border: 1px solid var(--border-strong);
+      display: inline-block;
+      position: relative;
+    }
+
+    .card-title {
+      font-size: 11.5px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--text-main);
+      font-family: var(--font-mono);
+    }
+
+    .card-meta {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: var(--orange);
+      background: var(--bg-screen);
+      border: 1px solid var(--border-bevel);
+      padding: 2px 6px;
+      border-radius: 2px;
+      letter-spacing: 0.04em;
+    }
+
+    .card-body {
+      padding: 18px;
+    }
+
+    /* ==========================================================================
+       INPUTS, CONFIG FIELDS & TACTILE MECHANICAL BUTTONS
+       ========================================================================== */
+    .field-group {
+      display: grid;
+      grid-template-columns: 135px 1fr;
+      align-items: center;
+      border: 1px solid var(--border-bevel);
+      border-radius: 2px;
+      background: var(--bg-screen);
+      box-shadow: inset 0 2px 4px rgba(0,0,0,0.75);
+      margin-bottom: 10px;
+      overflow: hidden;
+    }
+
+    .field-key {
+      padding: 9px 12px;
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      font-weight: 600;
+      color: var(--text-muted);
+      border-right: 1px solid var(--border-bevel);
+      background: #161614;
+      user-select: none;
+      letter-spacing: 0.04em;
+    }
+
+    .field-val {
+      padding: 7px 12px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: var(--text-main);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .token-field {
+      border: none;
+      background: transparent;
+      color: var(--led-amber);
+      font-family: var(--font-mono);
+      font-size: 12px;
+      outline: none;
+      width: 100%;
+    }
+
+    /* Tactile Keycap Buttons */
+    .btn {
+      background: var(--orange);
+      color: #ffffff;
+      border: 1px solid #ff7733;
+      border-radius: var(--radius);
+      padding: 8px 15px;
+      font-size: 11.5px;
+      font-weight: 700;
+      font-family: var(--font-mono);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.3), 0 3px 0 var(--orange-shadow), 0 4px 6px rgba(0,0,0,0.5);
+      transition: transform 0.08s ease, box-shadow 0.08s ease, background 0.1s ease;
+    }
+
+    .btn:hover {
+      background: var(--orange-hi);
+    }
+
+    .btn:active {
+      transform: translateY(2px);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.2), 0 1px 0 var(--orange-shadow);
+    }
+
+    .btn-secondary {
+      background: var(--bg-elevated);
+      color: var(--text-main);
+      border: 1px solid var(--border-strong);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.06), 0 3px 0 var(--border-groove), 0 4px 6px rgba(0,0,0,0.4);
+    }
+
+    .btn-secondary:hover {
+      background: #2f2f2b;
+    }
+
+    .btn-secondary:active {
+      transform: translateY(2px);
+      box-shadow: 0 1px 0 var(--border-groove);
+    }
+
+    .btn-mini {
+      background: var(--bg-elevated);
+      color: var(--text-main);
+      border: 1px solid var(--border-strong);
+      border-radius: 2px;
+      padding: 3px 8px;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      font-weight: 600;
+      cursor: pointer;
+      box-shadow: 0 2px 0 var(--border-groove);
+    }
+
+    .btn-mini:hover {
+      border-color: var(--orange);
+      color: var(--orange);
+    }
+
+    .btn-mini:active {
+      transform: translateY(1px);
+      box-shadow: none;
+    }
+
+    .btn-danger-mini {
+      background: #231416;
+      color: var(--led-red);
+      border: 1px solid rgba(255, 23, 68, 0.4);
+      border-radius: 2px;
+      padding: 3px 8px;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      font-weight: 600;
+      cursor: pointer;
+      box-shadow: 0 2px 0 var(--border-groove);
+    }
+
+    .btn-danger-mini:hover {
+      background: var(--led-red);
+      color: #ffffff;
+    }
+
+    /* ==========================================================================
+       RECESSED METRICS READOUT BAY
+       ========================================================================== */
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+
+    .metric-cell {
+      background: var(--bg-screen);
+      border: 1px solid var(--border-bevel);
+      box-shadow: inset 0 2px 6px rgba(0,0,0,0.85);
+      border-radius: 2px;
+      padding: 12px 14px;
+    }
+
+    .metric-label {
+      font-family: var(--font-mono);
+      font-size: 9.5px;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      margin-bottom: 6px;
+      letter-spacing: 0.08em;
+    }
+
+    .metric-value {
+      font-family: var(--font-mono);
+      font-size: 16px;
+      font-weight: 700;
+      color: var(--led-green);
+      letter-spacing: -0.02em;
+    }
+
+    .metric-sub {
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      color: var(--text-muted);
+      margin-top: 3px;
+    }
+
+    /* ==========================================================================
+       DATA TABLE & LED SEGMENTED QUOTA BAR
+       ========================================================================== */
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: var(--font-mono);
+      font-size: 12px;
+    }
+
+    th {
+      text-align: left;
+      padding: 10px 18px;
+      color: var(--text-muted);
+      border-bottom: 2px solid var(--border-groove);
+      font-weight: 600;
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      background: #161614;
+    }
+
+    td {
+      padding: 13px 18px;
+      border-bottom: 1px solid var(--border-bevel);
+      vertical-align: middle;
+    }
+
+    tr:last-child td {
+      border-bottom: none;
+    }
+
+    .status-indicator {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      font-weight: 700;
+      font-size: 11px;
+      background: var(--bg-screen);
+      padding: 3px 8px;
+      border: 1px solid var(--border-bevel);
+      border-radius: 2px;
+    }
+
+    .status-indicator.ready { color: var(--led-green); }
+    .status-indicator.warn { color: var(--led-amber); }
+    .status-indicator.err { color: var(--led-red); }
+
+    .tag-square {
+      font-size: 9.5px;
+      padding: 1px 5px;
+      background: var(--orange);
+      color: #ffffff;
+      font-weight: 700;
+      margin-left: 6px;
+      border-radius: 2px;
+    }
+
+    /* LED Matrix Segmented Quota Bar */
+    .quota-wrap {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .segmented-bar {
+      display: flex;
+      gap: 3px;
+      width: 116px;
+      background: var(--bg-screen);
+      padding: 4px;
+      border: 1px solid var(--border-bevel);
+      border-radius: 2px;
+      box-shadow: inset 0 1px 3px rgba(0,0,0,0.9);
+    }
+
+    .seg {
+      height: 8px;
+      flex: 1;
+      background: #1b221e;
+    }
+
+    .seg.filled {
+      background: var(--led-green);
+      box-shadow: 0 0 4px rgba(0, 230, 118, 0.5);
+    }
+
+    /* ==========================================================================
+       LIVE REQUEST TRAFFIC CONSOLE (RECESSED CRT/MATRIX SCREEN)
+       ========================================================================== */
+    .console-box {
+      background: var(--bg-screen);
+      box-shadow: inset 0 3px 8px rgba(0,0,0,0.9);
+      font-family: var(--font-mono);
+      font-size: 12px;
+      padding: 12px 18px;
+      max-height: 210px;
+      overflow-y: auto;
+    }
+
+    .log-line {
+      display: grid;
+      grid-template-columns: 80px 55px 1fr 75px 65px;
+      gap: 12px;
+      padding: 5px 0;
+      border-bottom: 1px dashed #1f221f;
+      align-items: center;
+    }
+
+    .log-line:last-child { border-bottom: none; }
+    .log-time { color: var(--text-dim); }
+    .log-method { color: var(--orange); font-weight: 700; }
+    .log-path { color: var(--text-main); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .log-status-200 { color: var(--led-green); }
+    .log-status-400 { color: var(--led-amber); }
+    .log-status-500 { color: var(--led-red); }
+    .log-dur { color: var(--text-muted); text-align: right; }
+
+    /* ==========================================================================
+       MODALS & TOAST
+       ========================================================================== */
+    .modal-backdrop {
+      display: none;
+      background: rgba(10, 10, 9, 0.85);
+      backdrop-filter: blur(3px);
+      position: fixed;
+      inset: 0;
+      align-items: center;
+      justify-content: center;
+      z-index: 100;
+    }
     .modal-backdrop.active { display: flex; }
-    .modal { background: var(--bg-surface); border: 1px solid var(--border-card); border-radius: var(--card-radius); width: 100%; max-width: 440px; padding: 24px; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.6); }
 
-    /* Toast */
-    .toast { position: fixed; bottom: 24px; right: 24px; background: #0284c7; color: #fff; padding: 10px 18px; border-radius: 8px; font-size: 13px; font-weight: 500; display: none; z-index: 200; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.4); }
+    .modal {
+      background: var(--bg-module);
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius);
+      box-shadow: 0 6px 0 var(--border-groove), 0 20px 40px rgba(0,0,0,0.8);
+      width: 100%;
+      max-width: 420px;
+      padding: 20px;
+    }
 
-    /* Tab views */
+    .input {
+      background: var(--bg-screen);
+      border: 1px solid var(--border-bevel);
+      box-shadow: inset 0 2px 5px rgba(0,0,0,0.8);
+      border-radius: 2px;
+      padding: 10px 12px;
+      color: var(--text-main);
+      font-family: var(--font-mono);
+      width: 100%;
+      font-size: 12px;
+      outline: none;
+      margin: 12px 0;
+    }
+
+    .input:focus { border-color: var(--orange); }
+
+    .toast {
+      position: fixed;
+      bottom: 22px;
+      right: 22px;
+      background: var(--orange);
+      color: #ffffff;
+      border: 1px solid #ff7733;
+      padding: 9px 16px;
+      border-radius: var(--radius);
+      font-family: var(--font-mono);
+      font-size: 12px;
+      font-weight: 700;
+      display: none;
+      z-index: 200;
+      box-shadow: 0 3px 0 var(--orange-shadow), 0 8px 16px rgba(0,0,0,0.6);
+    }
+
     .tab-view { display: none; }
     .tab-view.active { display: block; }
+
+    .icon {
+      width: 14px;
+      height: 14px;
+      stroke: currentColor;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      fill: none;
+    }
   </style>
 </head>
 <body>
-  <!-- Sidebar -->
-  <aside class="app-sidebar">
-    <div class="brand">
-      <div class="brand-logo">
-        <svg class="icon" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg>
-      </div>
-      <div>
-        <div style="font-weight:700; font-size:14px; letter-spacing:-0.02em;">ZGate</div>
-        <div style="font-size:11px; color:var(--text-muted);">AI Gateway Proxy</div>
-      </div>
-    </div>
 
-    <ul class="nav-list">
-      <li class="nav-item active" onclick="switchTab('dashboard', this)">
-        <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
-        <span>Dashboard</span>
-      </li>
-      <li class="nav-item" onclick="switchTab('accounts', this)">
-        <svg class="icon" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M23 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></svg>
-        <span>Accounts Pool</span>
-      </li>
-      <li class="nav-item" onclick="switchTab('routing', this)">
-        <svg class="icon" viewBox="0 0 24 24"><circle cx="18" cy="5" r="3"></circle><circle cx="6" cy="12" r="3"></circle><circle cx="18" cy="19" r="3"></circle><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"></line><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"></line></svg>
-        <span>9Router Setup</span>
-      </li>
-    </ul>
-
-    <div class="sidebar-footer">
-      <div class="daemon-card">
-        <div class="daemon-status">
-          <span style="color:var(--text-muted);">Daemon Node</span>
-          <span><span class="dot-online"></span> <strong id="daemonStatusText" style="color:#34d399;">ONLINE</strong></span>
+  <!-- ========================================================================
+       DASHBOARD HARDWARE CHASSIS
+       ======================================================================== -->
+  <div class="app-shell">
+    <!-- Sidebar -->
+    <aside class="app-sidebar">
+      <div class="brand">
+        <div class="brand-left">
+          <div class="brand-mark">Z</div>
+          <div class="brand-title-wrap">
+            <span class="brand-name">ZGate</span>
+            <span class="brand-sub">AI PROXY UNIT</span>
+          </div>
         </div>
-        <div style="font-size:11px; color:var(--text-muted); line-height:1.6;" id="daemonHostText">127.0.0.1:20131</div>
-      </div>
-    </div>
-  </aside>
-
-  <!-- Main View Area -->
-  <main class="app-content">
-    <header class="app-topbar">
-      <div style="display:flex; align-items:center; gap:12px;">
-        <span class="badge badge-success" id="authBadge">Protected Mode</span>
-        <span style="font-size:13px; color:var(--text-muted);" id="headerNodeInfo">127.0.0.1:20131</span>
+        <span class="brand-ver">OP-2.4</span>
       </div>
 
-      <!-- Center Status / Metric Indicators -->
-      <div style="display:flex; align-items:center; gap:10px;">
-        <span class="badge badge-neutral">
-          <svg class="icon" style="width:12px; height:12px;" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
-          Latency: ~12ms
-        </span>
-        <span class="badge badge-success">
-          <svg class="icon" style="width:12px; height:12px;" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg>
-          GLM-5.3 Ready
-        </span>
+      <div class="nav-section-label">
+        <span>MODE SELECT</span>
+        <span class="screw"></span>
       </div>
+      <ul class="nav-list">
+        <li class="nav-item active" onclick="switchTab('dashboard', this)">
+          <div class="nav-item-left">
+            <span class="nav-led"></span>
+            <span>Dashboard</span>
+          </div>
+          <span class="nav-kbd">[01]</span>
+        </li>
+        <li class="nav-item" onclick="switchTab('accounts', this)">
+          <div class="nav-item-left">
+            <span class="nav-led"></span>
+            <span>Accounts Pool</span>
+          </div>
+          <span class="nav-kbd">[02]</span>
+        </li>
+        <li class="nav-item" onclick="switchTab('routing', this)">
+          <div class="nav-item-left">
+            <span class="nav-led"></span>
+            <span>9Router Setup</span>
+          </div>
+          <span class="nav-kbd">[03]</span>
+        </li>
+      </ul>
 
-      <div style="display:flex; gap:10px;">
-        <button class="btn btn-secondary" onclick="loadDashboard()">
-          <svg class="icon" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
-          Refresh
-        </button>
-        <button class="btn" onclick="startLoginModal()">
-          <svg class="icon" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
-          Add Z.ai Account
-        </button>
+      <div class="sidebar-footer">
+        <div class="lcd-bay">
+          <div class="daemon-row">
+            <span style="color:var(--text-dim);">DAEMON_NODE</span>
+            <span class="status-led"><span class="led-dot"></span><span id="daemonStatusText">ONLINE</span></span>
+          </div>
+          <div class="daemon-row" style="margin-bottom:0;">
+            <span style="color:var(--text-dim);">HOST_ADDR</span>
+            <span id="daemonHostText" style="color:var(--text-main);">127.0.0.1:20131</span>
+          </div>
+        </div>
       </div>
-    </header>
+    </aside>
 
-    <div class="main-scroll">
-      <!-- Tab 1: Dashboard Overview -->
-      <section id="tab-dashboard" class="tab-view active">
-        <div class="grid grid-2" style="margin-bottom:20px;">
-          <!-- 9Router Card (Refined with Bridge Token Field & Copy) -->
-          <div class="card">
-            <h3 class="card-title">
-              <svg class="icon" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"></rect><rect x="2" y="14" width="20" height="8" rx="2" ry="2"></rect><line x1="6" y1="6" x2="6.01" y2="6"></line><line x1="6" y1="18" x2="6.01" y2="18"></line></svg>
-              Fast 9Router Configuration
-            </h3>
-            <p style="font-size:12px; color:var(--text-muted); margin-bottom:12px;">Connect your local 9Router to this gateway node:</p>
-            <div style="display:flex; flex-direction:column; gap:8px; margin-bottom:14px;">
-              <div><span style="font-size:12px; color:var(--text-muted)">Base URL:</span> <div class="config-code" id="dashBaseUrl">http://127.0.0.1:20131/v1</div></div>
-              <div><span style="font-size:12px; color:var(--text-muted)">Prefix:</span> <div class="config-code">zcode</div></div>
-              <div>
-                <span style="font-size:12px; color:var(--text-muted)">Bridge Token (API Key):</span>
-                <div class="token-input-wrap">
-                  <input type="password" id="bridgeTokenField" class="token-field" readonly value="Loading...">
-                  <button class="icon-btn" onclick="toggleTokenVisibility()" title="Toggle Visibility">
-                    <svg class="icon" id="eyeIcon" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
-                  </button>
-                  <button class="icon-btn" onclick="copyBridgeTokenOnly()" title="Copy API Key">
-                    <svg class="icon" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-                  </button>
+    <!-- Main View Area -->
+    <main class="app-content">
+      <!-- Topbar Telemetry Bay -->
+      <header class="app-topbar">
+        <div class="telemetry-screen">
+          <div class="telemetry-item">
+            <span class="telemetry-key">SECURITY:</span>
+            <span class="telemetry-val" id="authBadge" style="color:var(--led-green);">PROTECTED_MODE</span>
+          </div>
+          <span class="telemetry-sep">|</span>
+          <div class="telemetry-item">
+            <span class="telemetry-key">BIND:</span>
+            <span class="telemetry-val" id="headerNodeInfo">127.0.0.1:20131</span>
+          </div>
+          <span class="telemetry-sep">|</span>
+          <div class="telemetry-item">
+            <span class="telemetry-key">PING:</span>
+            <span class="telemetry-val" style="color:var(--led-amber);">~12ms</span>
+          </div>
+          <span class="telemetry-sep">|</span>
+          <div class="telemetry-item">
+            <span class="telemetry-key">ENGINE:</span>
+            <span class="telemetry-val" style="color:var(--led-green);">GLM-5.3 [READY]</span>
+          </div>
+        </div>
+
+        <div style="display:flex; gap:10px; flex-shrink:0;">
+          <button class="btn btn-secondary" onclick="loadDashboard()">
+            <svg class="icon" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
+            Refresh
+          </button>
+          <button class="btn" onclick="startLoginModal()">
+            + Add Z.ai Account
+          </button>
+        </div>
+      </header>
+
+      <div class="main-scroll">
+        <!-- Tab 1: Dashboard Overview -->
+        <section id="tab-dashboard" class="tab-view active">
+          <div class="grid-2">
+            <!-- 9Router Card -->
+            <div class="card">
+              <div class="card-header">
+                <div class="card-title-group">
+                  <span class="screw"></span>
+                  <h3 class="card-title">Fast 9Router Configuration</h3>
+                </div>
+                <span class="card-meta">CH_01 // BRIDGE</span>
+              </div>
+              <div class="card-body">
+                <div class="field-group">
+                  <div class="field-key">BASE_URL</div>
+                  <div class="field-val" id="dashBaseUrl">http://127.0.0.1:20131/v1</div>
+                </div>
+                <div class="field-group">
+                  <div class="field-key">PREFIX</div>
+                  <div class="field-val">zcode</div>
+                </div>
+                <div class="field-group" style="margin-bottom:14px;">
+                  <div class="field-key">BRIDGE_TOKEN</div>
+                  <div class="field-val">
+                    <input type="password" id="bridgeTokenField" class="token-field" readonly value="dummy-key">
+                    <div style="display:flex; gap:6px;">
+                      <button class="btn-mini" onclick="toggleTokenVisibility()">VIEW</button>
+                      <button class="btn-mini" onclick="copyBridgeTokenOnly()">COPY</button>
+                    </div>
+                  </div>
+                </div>
+                <button class="btn" style="width:100%; justify-content:center;" onclick="copy9RouterConfig()">
+                  Copy 9Router JSON Configuration
+                </button>
+              </div>
+            </div>
+
+            <!-- Performance & Concurrency Card -->
+            <div class="card">
+              <div class="card-header">
+                <div class="card-title-group">
+                  <span class="screw"></span>
+                  <h3 class="card-title">Node Performance & Metrics</h3>
+                </div>
+                <span class="card-meta">CH_02 // TELEMETRY</span>
+              </div>
+              <div class="card-body">
+                <div class="metrics-grid">
+                  <div class="metric-cell">
+                    <div class="metric-label">Scheduler Mode</div>
+                    <div class="metric-value" style="color:var(--text-main); font-size:14px;">Least-InFlight</div>
+                    <div class="metric-sub">Round-Robin Routing</div>
+                  </div>
+                  <div class="metric-cell">
+                    <div class="metric-label">Rate Limiter</div>
+                    <div class="metric-value" style="color:var(--led-amber); font-size:14px;">20 RPS / 40 Burst</div>
+                    <div class="metric-sub">Token-Bucket Active</div>
+                  </div>
+                  <div class="metric-cell">
+                    <div class="metric-label">Global Lane Width</div>
+                    <div class="metric-value" id="dashLaneWidth">1</div>
+                    <div class="metric-sub">Parallel Concurrency</div>
+                  </div>
+                  <div class="metric-cell">
+                    <div class="metric-label">Active Account Pool</div>
+                    <div class="metric-value" id="dashAcctCount">0</div>
+                    <div class="metric-sub">Enrolled Credentials</div>
+                  </div>
                 </div>
               </div>
             </div>
-            <button class="btn" style="width:100%; justify-content:center;" onclick="copy9RouterConfig()">
-              <svg class="icon" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-              Copy 9Router JSON Configuration
-            </button>
           </div>
 
-          <!-- Performance & Concurrency Card -->
+          <!-- Accounts Summary with Quota & Usage -->
           <div class="card">
-            <h3 class="card-title">
-              <svg class="icon" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"></path></svg>
-              Node Performance & Metrics
-            </h3>
-            <div style="font-size:13px; line-height:2.2;">
-              <div style="display:flex; justify-content:space-between; border-bottom:1px solid var(--border-card)">
-                <span style="color:var(--text-muted)">Scheduler Mode</span>
-                <span>Least-InFlight Round-Robin</span>
+            <div class="card-header">
+              <div class="card-title-group">
+                <span class="screw"></span>
+                <h3 class="card-title">Active Credential Pool & Quota Balance</h3>
               </div>
-              <div style="display:flex; justify-content:space-between; border-bottom:1px solid var(--border-card)">
-                <span style="color:var(--text-muted)">Global Lane Width</span>
-                <strong id="dashLaneWidth" style="color:var(--accent-primary)">1</strong>
+              <span class="card-meta">BANK_A // QUOTA</span>
+            </div>
+            <table>
+              <thead>
+                <tr>
+                  <th>Status</th>
+                  <th>Account Label</th>
+                  <th>Token Balance (Quota)</th>
+                  <th>Cooldown</th>
+                  <th style="text-align:right;">Actions</th>
+                </tr>
+              </thead>
+              <tbody id="overviewAccountRows"></tbody>
+            </table>
+          </div>
+
+          <!-- Live Request Traffic Activity -->
+          <div class="card" style="margin-bottom:0;">
+            <div class="card-header">
+              <div class="card-title-group">
+                <span class="screw"></span>
+                <h3 class="card-title">Live Request Traffic Activity</h3>
               </div>
-              <div style="display:flex; justify-content:space-between; border-bottom:1px solid var(--border-card)">
-                <span style="color:var(--text-muted)">Active Account Pool</span>
-                <strong id="dashAcctCount" style="color:var(--accent-primary)">0</strong>
+              <span class="card-meta" id="trafficCountText">0 recent events</span>
+            </div>
+            <div class="console-box" id="trafficConsole"></div>
+          </div>
+        </section>
+
+        <!-- Tab 2: Accounts Management -->
+        <section id="tab-accounts" class="tab-view">
+          <div class="card">
+            <div class="card-header">
+              <div class="card-title-group">
+                <span class="screw"></span>
+                <h3 class="card-title">Stored Z.ai Accounts & Balances</h3>
               </div>
-              <div style="display:flex; justify-content:space-between;">
-                <span style="color:var(--text-muted)">Rate Limiter</span>
-                <span>Token-Bucket (20 rps / 40 burst)</span>
+              <button class="btn" onclick="startLoginModal()">+ Add New Account</button>
+            </div>
+            <table>
+              <thead>
+                <tr>
+                  <th>Status</th>
+                  <th>Identifier / Label</th>
+                  <th>Token Quota Remaining</th>
+                  <th>Cooldown Timer</th>
+                  <th style="text-align:right;">Actions</th>
+                </tr>
+              </thead>
+              <tbody id="fullAccountRows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <!-- Tab 3: 9Router & Models Integration -->
+        <section id="tab-routing" class="tab-view">
+          <div class="card">
+            <div class="card-header">
+              <div class="card-title-group">
+                <span class="screw"></span>
+                <h3 class="card-title">Provider Setup Instructions for 9Router</h3>
               </div>
+              <span class="card-meta">MANUAL // SPEC</span>
+            </div>
+            <div class="card-body">
+              <div class="lcd-bay" style="margin-bottom:16px; line-height:1.9; color:var(--text-muted); font-size:12.5px;">
+                01. Open your 9Router local dashboard.<br>
+                02. Add a new Provider node with <strong style="color:var(--text-main);">API Type: Chat Completions</strong>.<br>
+                03. Set <strong style="color:var(--text-main);">Base URL:</strong> <span id="routeBaseUrl" style="color:var(--led-green);">http://127.0.0.1:20131/v1</span><br>
+                04. Set <strong style="color:var(--text-main);">Prefix:</strong> <span style="color:var(--led-amber);">zcode</span><br>
+                05. In the Model mapping field, add <code style="color:var(--text-main);">glm-5.3-flash</code> or <code style="color:var(--text-main);">glm-5.3</code>.
+              </div>
+              <button class="btn" onclick="copy9RouterConfig()">Copy JSON Configuration</button>
             </div>
           </div>
-        </div>
-
-        <!-- Accounts Summary with Quota & Usage -->
-        <div class="card" style="margin-bottom:20px;">
-          <h3 class="card-title">
-            <svg class="icon" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
-            Active Credential Pool & Quota Balance
-          </h3>
-          <table>
-            <thead>
-              <tr>
-                <th>Status</th>
-                <th>Account Label</th>
-                <th>Token Balance (Quota)</th>
-                <th>Cooldown</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody id="overviewAccountRows">
-              <tr><td colspan="5" style="text-align:center; color:var(--text-muted); padding:20px;">Loading accounts...</td></tr>
-            </tbody>
-          </table>
-        </div>
-
-        <!-- Live Request Traffic Activity -->
-        <div class="card">
-          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
-            <h3 class="card-title" style="margin:0;">
-              <svg class="icon" viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>
-              Live Request Traffic Activity
-            </h3>
-            <span style="font-size:11px; color:var(--text-muted);" id="trafficCountText">0 recent events</span>
-          </div>
-          <div class="console-box" id="trafficConsole">
-            <div style="color:#64748b;">Waiting for requests from 9Router or client SDKs...</div>
-          </div>
-        </div>
-      </section>
-
-      <!-- Tab 2: Accounts Management -->
-      <section id="tab-accounts" class="tab-view">
-        <div class="card">
-          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
-            <h3 class="card-title" style="margin:0;">
-              <svg class="icon" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle></svg>
-              Stored Z.ai Accounts & Balances
-            </h3>
-            <button class="btn" onclick="startLoginModal()">+ Add New Account</button>
-          </div>
-          <table>
-            <thead>
-              <tr>
-                <th>Status</th>
-                <th>Identifier / Label</th>
-                <th>Token Quota Remaining</th>
-                <th>Cooldown Timer</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody id="fullAccountRows">
-              <tr><td colspan="5" style="text-align:center; color:var(--text-muted); padding:20px;">Loading...</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </section>
-
-      <!-- Tab 3: 9Router & Models Integration -->
-      <section id="tab-routing" class="tab-view">
-        <div class="card" style="margin-bottom:20px;">
-          <h3 class="card-title">
-            <svg class="icon" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg>
-            Provider Setup Instructions for 9Router
-          </h3>
-          <p style="font-size:13px; color:var(--text-muted); line-height:1.7; margin-bottom:16px;">
-            1. Open your 9Router local dashboard.<br>
-            2. Add a new Provider node with <strong>API Type: Chat Completions</strong>.<br>
-            3. Set <strong>Base URL:</strong> <code class="config-code" id="routeBaseUrl">http://127.0.0.1:20131/v1</code><br>
-            4. Set <strong>Prefix:</strong> <code class="config-code">zcode</code><br>
-            5. In the Model mapping field, add <code>glm-5.3-flash</code> or <code>glm-5.3</code>.
-          </p>
-          <div style="display:flex; gap:10px;">
-            <button class="btn" onclick="copy9RouterConfig()">Copy JSON Configuration</button>
-          </div>
-        </div>
-      </section>
-    </div>
-  </main>
+        </section>
+      </div>
+    </main>
+  </div>
 
   <!-- Login Modal -->
   <div class="modal-backdrop" id="loginModal">
     <div class="modal">
-      <h3 style="font-size:16px; margin-bottom:8px; color:#fff;">Add Z.ai Account</h3>
-      <p style="font-size:13px; color:var(--text-muted); margin-bottom:16px;">Sign in via official Z.ai OAuth device flow.</p>
+      <div style="font-family:var(--font-mono); font-weight:700; font-size:13px; color:var(--orange); margin-bottom:6px;">// ADD Z.AI ACCOUNT</div>
+      <p style="font-size:12px; color:var(--text-muted); margin-bottom:8px;">Sign in via official Z.ai OAuth device flow.</p>
       
       <input type="text" id="loginLabel" class="input" placeholder="Account Label (e.g. Work, Personal)">
       
@@ -338,11 +1032,11 @@
       </div>
 
       <div id="loginStep2" style="display:none; text-align:center; margin-top:14px;">
-        <a id="loginAuthUrl" href="#" target="_blank" class="btn" style="width:100%; justify-content:center; margin-bottom:10px;">Open Z.ai Approval Page</a>
-        <p style="font-size:12px; color:var(--text-muted);">Waiting for browser authorization...</p>
+        <a id="loginAuthUrl" href="#" target="_blank" class="btn" style="width:100%; justify-content:center; margin-bottom:10px; text-decoration:none;">Open Z.ai Approval Page</a>
+        <p style="font-size:11px; font-family:var(--font-mono); color:var(--led-amber);">Waiting for browser authorization...</p>
       </div>
 
-      <div style="margin-top:18px; text-align:right;">
+      <div style="margin-top:16px; text-align:right;">
         <button class="btn btn-secondary" onclick="closeLoginModal()">Close</button>
       </div>
     </div>
@@ -351,16 +1045,14 @@
   <!-- Password Gate Modal for VPS Admin Key -->
   <div class="modal-backdrop" id="adminAuthModal">
     <div class="modal">
-      <h3 style="font-size:16px; margin-bottom:8px; color:#fff;">Gateway Admin Access</h3>
-      <p style="font-size:13px; color:var(--text-muted); margin-bottom:16px;">Enter the GATEWAY_ADMIN_KEY password configured on this server:</p>
+      <div style="font-family:var(--font-mono); font-weight:700; font-size:13px; color:var(--orange); margin-bottom:6px;">// GATEWAY ADMIN ACCESS</div>
+      <p style="font-size:12px; color:var(--text-muted);">Enter the GATEWAY_ADMIN_KEY password configured on this server:</p>
       <input type="password" id="adminPasswordInput" class="input" placeholder="Admin Password">
-      <div style="text-align:right; margin-top:10px;">
-        <button class="btn" style="width:100%; justify-content:center;" onclick="submitAdminLogin()">Unlock Dashboard</button>
-      </div>
+      <button class="btn" style="width:100%; justify-content:center;" onclick="submitAdminLogin()">Unlock Dashboard</button>
     </div>
   </div>
 
-  <div class="toast" id="toast">Copied to clipboard!</div>
+  <div class="toast" id="toast">COPIED TO CLIPBOARD</div>
 
   <script>
     let pollInterval = null;
@@ -377,6 +1069,7 @@
     async function checkAuth() {
       try {
         const res = await fetch('/api/dashboard/auth/verify');
+        if (!res.ok) return true;
         const data = await res.json();
         if (data.requiresAuth && !data.authorized) {
           document.getElementById('adminAuthModal').classList.add('active');
@@ -391,17 +1084,21 @@
 
     async function submitAdminLogin() {
       const key = document.getElementById('adminPasswordInput').value.trim();
-      const res = await fetch('/api/dashboard/auth/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ key })
-      });
-      const data = await res.json();
-      if (data.ok) {
+      try {
+        const res = await fetch('/api/dashboard/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ key })
+        });
+        const data = await res.json();
+        if (data.ok) {
+          document.getElementById('adminAuthModal').classList.remove('active');
+          loadDashboard();
+        } else {
+          showToast('INVALID ADMIN PASSWORD');
+        }
+      } catch (e) {
         document.getElementById('adminAuthModal').classList.remove('active');
-        loadDashboard();
-      } else {
-        alert('Invalid admin password');
       }
     }
 
@@ -411,6 +1108,7 @@
 
       try {
         const res = await fetch('/api/dashboard/status');
+        if (!res.ok) throw new Error('Network error');
         const data = await res.json();
         const base = window.location.origin + '/v1';
         document.getElementById('dashBaseUrl').textContent = base;
@@ -418,14 +1116,11 @@
         document.getElementById('dashLaneWidth').textContent = data.laneWidth || '1';
         document.getElementById('dashAcctCount').textContent = (data.accounts || []).length;
         document.getElementById('headerNodeInfo').textContent = window.location.host;
+        document.getElementById('daemonHostText').textContent = window.location.host;
 
         actualBridgeToken = data.bridgeToken || '';
         const tokenInput = document.getElementById('bridgeTokenField');
-        if (actualBridgeToken) {
-          tokenInput.value = actualBridgeToken;
-        } else {
-          tokenInput.value = 'dummy-key';
-        }
+        tokenInput.value = actualBridgeToken || 'dummy-key';
 
         renderAccounts(data.accounts || []);
         renderLogs(data.logs || []);
@@ -436,20 +1131,13 @@
 
     function toggleTokenVisibility() {
       const field = document.getElementById('bridgeTokenField');
-      const eye = document.getElementById('eyeIcon');
-      if (field.type === 'password') {
-        field.type = 'text';
-        eye.innerHTML = '<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path><line x1="1" y1="1" x2="23" y2="23"></line>';
-      } else {
-        field.type = 'password';
-        eye.innerHTML = '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle>';
-      }
+      field.type = field.type === 'password' ? 'text' : 'password';
     }
 
     function copyBridgeTokenOnly() {
-      const val = actualBridgeToken || 'dummy-key';
+      const val = actualBridgeToken || document.getElementById('bridgeTokenField').value || 'dummy-key';
       navigator.clipboard.writeText(val);
-      showToast('API Key copied to clipboard!');
+      showToast('API KEY COPIED TO CLIPBOARD');
     }
 
     function formatNumber(num) {
@@ -459,42 +1147,57 @@
       return Math.round(num).toString();
     }
 
+    function buildSegmentedBar(pctLeft) {
+      const totalSegments = 10;
+      const filledCount = Math.round((pctLeft / 100) * totalSegments);
+      let html = '<div class="segmented-bar">';
+      for (let i = 0; i < totalSegments; i++) {
+        html += `<span class="seg ${i < filledCount ? 'filled' : ''}"></span>`;
+      }
+      html += '</div>';
+      return html;
+    }
+
     function renderAccounts(accounts) {
       const rows = accounts.map(a => {
-        let stateBadge = '<span class="badge badge-success">Ready</span>';
-        if (a.needsReauth) stateBadge = '<span class="badge" style="background:rgba(239,68,68,0.15); color:#f87171; border:1px solid rgba(239,68,68,0.3)">Re-auth Required</span>';
-        else if (a.expired) stateBadge = '<span class="badge" style="background:rgba(245,158,11,0.15); color:#fbbf24; border:1px solid rgba(245,158,11,0.3)">Expired</span>';
-        else if (a.cooldownUntil) stateBadge = '<span class="badge" style="background:rgba(245,158,11,0.15); color:#fbbf24; border:1px solid rgba(245,158,11,0.3)">Cooling Down</span>';
+        let stateBadge = '<span class="status-indicator ready">● READY</span>';
+        if (a.needsReauth) stateBadge = '<span class="status-indicator err">▲ RE-AUTH</span>';
+        else if (a.expired) stateBadge = '<span class="status-indicator warn">▲ EXPIRED</span>';
+        else if (a.cooldownUntil) stateBadge = '<span class="status-indicator warn">◷ COOLDOWN</span>';
 
         const total = a.totalUnits || 0;
         const remain = a.remainUnits || 0;
         const pct = a.usagePercent || 0;
+        const pctLeft = Math.max(0, 100 - pct);
+
         const quotaDisplay = total > 0 ? `
-          <div>
-            <div style="font-size:12px; color:#e2e8f0; font-family:'JetBrains Mono',monospace;">
-              <strong>${formatNumber(remain)}</strong> / ${formatNumber(total)} <span style="font-size:10px; color:var(--text-muted)">(${100 - pct}% left)</span>
-            </div>
-            <div class="progress-track">
-              <div class="progress-fill" style="width: ${Math.max(4, 100 - pct)}%"></div>
+          <div class="quota-wrap">
+            ${buildSegmentedBar(pctLeft)}
+            <div>
+              <strong>${formatNumber(remain)}</strong> / ${formatNumber(total)}
+              <span style="font-size:10px; color:var(--text-muted)">(${pctLeft}% left)</span>
             </div>
           </div>
-        ` : `<span style="color:var(--text-muted); font-size:12px;">Active (Unlimited / Start Plan)</span>`;
+        ` : `<span style="color:var(--text-muted); font-size:12px;">ACTIVE (UNLIMITED)</span>`;
 
         return `
           <tr>
             <td>${stateBadge}</td>
-            <td><strong>${escapeHtml(a.label || a.id)}</strong> ${a.default ? '<span class="badge badge-default" style="margin-left:6px;">Default</span>' : ''}</td>
+            <td>
+              <strong>${escapeHtml(a.label || a.id)}</strong>
+              ${a.default ? '<span class="tag-square">DEFAULT</span>' : ''}
+            </td>
             <td>${quotaDisplay}</td>
             <td>${a.cooldownUntil ? escapeHtml(a.cooldownUntil) : '-'}</td>
-            <td>
-              ${!a.default ? `<button class="btn btn-secondary" style="padding:2px 8px; font-size:11px;" onclick="setDefaultAccount('${a.id}')">Set Default</button>` : ''}
-              <button class="btn-ghost-danger" style="margin-left:4px;" onclick="removeAccount('${a.id}')">Delete</button>
+            <td style="text-align:right;">
+              ${!a.default ? `<button class="btn-mini" onclick="setDefaultAccount('${a.id}')">SET DEFAULT</button>` : ''}
+              <button class="btn-danger-mini" style="margin-left:6px;" onclick="removeAccount('${a.id}')">DELETE</button>
             </td>
           </tr>
         `;
       }).join('');
 
-      const empty = '<tr><td colspan="5" style="text-align:center; color:var(--text-muted); padding:20px;">No accounts stored. Click "+ Add Z.ai Account" to begin.</td></tr>';
+      const empty = '<tr><td colspan="5" style="text-align:center; color:var(--text-muted); padding:22px;">No accounts stored. Click "+ Add Z.ai Account" to begin.</td></tr>';
       document.getElementById('overviewAccountRows').innerHTML = rows || empty;
       document.getElementById('fullAccountRows').innerHTML = rows || empty;
     }
@@ -503,7 +1206,7 @@
       const consoleEl = document.getElementById('trafficConsole');
       const countEl = document.getElementById('trafficCountText');
       if (!logs || logs.length === 0) {
-        consoleEl.innerHTML = '<div style="color:#64748b;">Waiting for requests from 9Router or client SDKs...</div>';
+        consoleEl.innerHTML = '<div style="color:var(--text-dim); padding:8px 0;">Waiting for requests from 9Router or client SDKs...</div>';
         countEl.textContent = '0 recent events';
         return;
       }
@@ -517,11 +1220,10 @@
         return `
           <div class="log-line">
             <span class="log-time">[${l.timestamp}]</span>
-            <span style="color:#60a5fa; width:45px;">${escapeHtml(l.method)}</span>
-            <span style="flex:1; overflow:hidden; text-overflow:ellipsis;">${escapeHtml(l.path)}</span>
+            <span class="log-method">${escapeHtml(l.method)}</span>
+            <span class="log-path">${escapeHtml(l.path)}${tag}</span>
             <span class="${statusClass}">[${l.status}]</span>
-            <span style="color:#94a3b8; width:55px; text-align:right;">${l.duration_ms}ms</span>
-            <span style="color:#eab308;">${tag}</span>
+            <span class="log-dur">${l.duration_ms}ms</span>
           </div>
         `;
       }).reverse().join('');
@@ -536,6 +1238,7 @@
     async function removeAccount(id) {
       if (!confirm('Are you sure you want to remove this account?')) return;
       await fetch('/api/dashboard/account/remove?id=' + encodeURIComponent(id), { method: 'POST' });
+      showToast('ACCOUNT REMOVED');
       loadDashboard();
     }
 
@@ -561,8 +1264,7 @@
         });
         const data = await res.json();
         if (!data.ok) {
-          const errDetail = typeof data.error === 'object' ? JSON.stringify(data.error) : (data.error || 'Server error');
-          alert('Failed to start login: ' + errDetail);
+          showToast('FAILED TO START LOGIN');
           return;
         }
         document.getElementById('loginStep1').style.display = 'none';
@@ -578,11 +1280,11 @@
             if (pollData.status === 'success') {
               clearInterval(pollInterval);
               closeLoginModal();
-              showToast('Account added successfully!');
+              showToast('ACCOUNT ADDED SUCCESSFULLY');
               loadDashboard();
             } else if (pollData.status === 'failed') {
               clearInterval(pollInterval);
-              alert('Login failed: ' + (typeof pollData.error === 'object' ? JSON.stringify(pollData.error) : pollData.error));
+              showToast('LOGIN FAILED');
               closeLoginModal();
             }
           } catch (e) {
@@ -590,7 +1292,7 @@
           }
         }, 2500);
       } catch (networkErr) {
-        alert('Network error communicating with gateway: ' + networkErr.message);
+        showToast('GATEWAY OFFLINE');
       }
     }
 
@@ -604,7 +1306,7 @@
         models: ["glm-5.3-flash", "glm-5.3"]
       };
       navigator.clipboard.writeText(JSON.stringify(config, null, 2));
-      showToast('9Router JSON configuration copied to clipboard!');
+      showToast('9ROUTER JSON COPIED');
     }
 
     function showToast(msg) {
