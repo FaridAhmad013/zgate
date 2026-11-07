@@ -30,13 +30,16 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
-	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apissaj/zcode-gateway/internal/accounts"
@@ -61,7 +64,7 @@ type UpstreamError struct {
 	AccountSwitch bool   // internal: rotation may continue with another account
 }
 
-func (e *UpstreamError) Error() string { return e.Msg }
+func (e *UpstreamError) Error() string { return auth.Redact(e.Msg) }
 
 func envOr(key, fallback string) string {
 	if v := strings.TrimSpace(osGetenv(key)); v != "" {
@@ -82,9 +85,13 @@ func errorFromResponse(status int, body []byte) *UpstreamError {
 		} `json:"error"`
 		Raw string `json:"-"`
 	}
-	text := string(body)
+	text := auth.Redact(string(body))
 	if json.Unmarshal(body, &env) != nil {
 		env.Raw = text
+	}
+	env.Msg = auth.Redact(env.Msg)
+	if env.Error != nil {
+		env.Error.Message = auth.Redact(env.Error.Message)
 	}
 	code := env.Code
 	message := ""
@@ -106,7 +113,7 @@ func errorFromResponse(status int, body []byte) *UpstreamError {
 			message = fmt.Sprintf("upstream %d", status)
 		}
 	}
-	return &UpstreamError{Msg: message, Status: status, Body: env, Kind: "upstream", Code: code}
+	return &UpstreamError{Msg: auth.Redact(message), Status: status, Body: env, Kind: "upstream", Code: code}
 }
 
 func msgSuffix(msg string) string {
@@ -117,12 +124,16 @@ func msgSuffix(msg string) string {
 }
 
 // isTransient reports gateway responses worth retrying in place: model
-// concurrency, 429, 5xx. Account-wide failures are switchable instead.
+// concurrency (3009), account concurrency (3008) when no alternate account is
+// available, generic 429 (excluding 1113 quota exhaustion), and 5xx.
 func isTransient(err *UpstreamError) bool {
 	if err == nil {
 		return false
 	}
-	if codeIs(err.Code, 3009) {
+	if codeIs(err.Code, 1113) {
+		return false
+	}
+	if codeIs(err.Code, 3009) || codeIs(err.Code, 3008) {
 		return true
 	}
 	if err.Status == http.StatusTooManyRequests || err.Status >= 500 {
@@ -132,9 +143,9 @@ func isTransient(err *UpstreamError) bool {
 }
 
 // isSwitchable reports errors that justify rotating to the next account:
-// this credential's allowance is spent, it is rejected, or its user slot is
-// parked by the desktop client. Anything else (model concurrency 3009, 5xx,
-// transport) is global-ish and gets retried in place instead.
+// this credential's allowance is spent (1113), it is rejected (401/403), or
+// its user slot is busy on the desktop client (3008). Global model concurrency
+// (3009) and 5xx get retried in place instead.
 func isSwitchable(err *UpstreamError, status int) bool {
 	if err == nil {
 		return false
@@ -149,6 +160,15 @@ func isSwitchable(err *UpstreamError, status int) bool {
 		return true
 	}
 	return false
+}
+
+func concurrencyCooldown() time.Duration {
+	if v := strings.TrimSpace(osGetenv("ZCODE_CONCURRENCY_COOLDOWN_MS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Millisecond
+		}
+	}
+	return 5 * time.Second
 }
 
 func codeIs(code any, want float64) bool {
@@ -230,21 +250,27 @@ func Candidates(jwt, accountID string) ([]candidate, error) {
 // canonical identity system blocks with the client's own system prompt
 // riding block 3, session metadata, and sane sampling defaults.
 func ShapePlanBody(body map[string]any, sessionID, deviceID, accountUUID string) (map[string]any, error) {
-	raw, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
+	if body == nil {
+		return nil, errors.New("nil request body")
 	}
-	var out map[string]any
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, err
+	out := make(map[string]any, len(body)+4)
+	for k, v := range body {
+		out[k] = v
 	}
 	out["system"] = systemprompt.BuildSystem(body["system"])
-	meta, _ := out["metadata"].(map[string]any)
-	if meta == nil {
-		meta = map[string]any{}
+
+	var meta map[string]any
+	if origMeta, ok := body["metadata"].(map[string]any); ok && len(origMeta) > 0 {
+		meta = make(map[string]any, len(origMeta)+1)
+		for k, v := range origMeta {
+			meta[k] = v
+		}
+	} else {
+		meta = make(map[string]any, 1)
 	}
 	meta["user_id"] = systemprompt.MetadataUserID(deviceID, sessionID, accountUUID)
 	out["metadata"] = meta
+
 	if out["max_tokens"] == nil {
 		out["max_tokens"] = 8192
 	}
@@ -257,38 +283,79 @@ func ShapePlanBody(body map[string]any, sessionID, deviceID, accountUUID string)
 var (
 	laneMu  sync.Mutex
 	laneSem chan struct{}
-	laneWg  sync.WaitGroup
 )
 
-func laneSlot() chan struct{} {
-	laneOnce.Do(func() {
-		width := 1
-		if v := osGetenv("ZCODE_LANE_WIDTH"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n > 0 {
-				width = n
-			}
+func resolveLaneWidth() int {
+	if v := strings.TrimSpace(osGetenv("ZCODE_LANE_WIDTH")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
 		}
-		laneSem = make(chan struct{}, width)
-	})
+	}
+	return 1
+}
+
+func laneSlot() chan struct{} {
+	want := resolveLaneWidth()
+	laneMu.Lock()
+	defer laneMu.Unlock()
+	if laneSem == nil || (cap(laneSem) != want && len(laneSem) == 0) {
+		laneSem = make(chan struct{}, want)
+	}
 	return laneSem
 }
 
-var laneOnce sync.Once
-
-// WithLane serializes inference calls through one lane (the gateway enforces
-// a per-account in-flight limit shared with the desktop client: 429 3008
-// user / 3009 model), so concurrent bridge clients queue instead of
-// collectively tripping the limit.
-func WithLane(ctx context.Context, fn func() error) error {
-	laneWg.Add(1)
-	defer laneWg.Done()
-	select {
-	case laneSlot() <- struct{}{}:
-		defer func() { <-laneSlot() }()
-		return fn()
-	case <-ctx.Done():
-		return ctx.Err()
+func acquireLane(ctx context.Context) (func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	sem := laneSlot()
+	select {
+	case sem <- struct{}{}:
+		var once sync.Once
+		return func() {
+			once.Do(func() { <-sem })
+		}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// WithLane serializes inference calls through the configured concurrency lane
+// (ZCODE_LANE_WIDTH, default 1). The gateway enforces a per-account in-flight
+// limit shared with the desktop client (429 3008 user / 3009 model), so
+// concurrent bridge clients queue instead of collectively tripping the limit.
+func WithLane(ctx context.Context, fn func() error) error {
+	release, err := acquireLane(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return fn()
+}
+
+// ErrStreamIdleTimeout is returned when an active stream receives no data
+// for longer than the configured idle timeout.
+var ErrStreamIdleTimeout = errors.New("upstream stream idle timeout")
+
+var sharedTransport = &http.Transport{
+	Proxy:                 http.ProxyFromEnvironment,
+	DialContext:           (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+	ForceAttemptHTTP2:     true,
+	MaxIdleConns:          100,
+	MaxIdleConnsPerHost:   20,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+}
+
+var sharedClient = &http.Client{
+	Transport: sharedTransport,
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
 }
 
 // SendOpts carries one upstream call's parameters.
@@ -299,7 +366,39 @@ type SendOpts struct {
 	ClientSessionID string         // conversation affinity key
 	Context         context.Context
 	HTTP            *http.Client
-	UpstreamTimeout time.Duration // hard deadline (0: 5m)
+	UpstreamTimeout time.Duration // response header deadline (0: 2m or ZCODE_HEADER_TIMEOUT_MS / ZCODE_UPSTREAM_TIMEOUT_MS)
+	IdleTimeout     time.Duration // per-read stream inactivity deadline (0: 2m or ZCODE_STREAM_IDLE_TIMEOUT_MS / ZCODE_UPSTREAM_TIMEOUT_MS)
+}
+
+func resolveHeaderTimeout(o SendOpts) time.Duration {
+	if o.UpstreamTimeout > 0 {
+		return o.UpstreamTimeout
+	}
+	for _, key := range []string{"ZCODE_HEADER_TIMEOUT_MS", "ZCODE_UPSTREAM_TIMEOUT_MS"} {
+		if v := strings.TrimSpace(osGetenv(key)); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				return time.Duration(n) * time.Millisecond
+			}
+		}
+	}
+	return 2 * time.Minute
+}
+
+func resolveIdleTimeout(o SendOpts) time.Duration {
+	if o.IdleTimeout > 0 {
+		return o.IdleTimeout
+	}
+	for _, key := range []string{"ZCODE_STREAM_IDLE_TIMEOUT_MS", "ZCODE_UPSTREAM_TIMEOUT_MS"} {
+		if v := strings.TrimSpace(osGetenv(key)); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				return time.Duration(n) * time.Millisecond
+			}
+		}
+	}
+	if o.UpstreamTimeout > 0 {
+		return o.UpstreamTimeout
+	}
+	return 2 * time.Minute
 }
 
 // SendAnthropic sends one Anthropic-shaped request to the plan endpoint
@@ -314,52 +413,89 @@ func SendAnthropic(o SendOpts) (*http.Response, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	cands, err := Candidates(o.JWT, o.AccountID)
+	// Pre-flight check outside the lane so missing credentials fail fast
+	// without acquiring or holding a lane slot.
+	preflight, err := Candidates(o.JWT, o.AccountID)
 	if err != nil {
 		return nil, err
 	}
-	timeout := o.UpstreamTimeout
-	if timeout <= 0 {
-		// ZCODE_UPSTREAM_TIMEOUT_MS hard-deadline override; default 5m.
-		if v := osGetenv("ZCODE_UPSTREAM_TIMEOUT_MS"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n > 0 {
-				timeout = time.Duration(n) * time.Millisecond
-			}
-		}
-		if timeout <= 0 {
-			timeout = 5 * time.Minute
-		}
+
+	releaseLane, err := acquireLane(ctx)
+	if err != nil {
+		return nil, &UpstreamError{Msg: "client went away", Status: 499, Kind: "upstream"}
 	}
+	laneTransferred := false
+	defer func() {
+		if !laneTransferred {
+			releaseLane()
+		}
+	}()
+
+	headerTimeout := resolveHeaderTimeout(o)
+	idleTimeout := resolveIdleTimeout(o)
 	client := o.HTTP
 	if client == nil {
-		client = &http.Client{Timeout: timeout}
+		client = sharedClient
+	}
+
+	// Explicit JWT override or legacy single-token fallback (no stored account ID).
+	if strings.TrimSpace(o.JWT) != "" || (len(preflight) == 1 && preflight[0].ID == "") {
+		res, err := runAccount(ctx, client, preflight[0], o, headerTimeout, idleTimeout, false)
+		if err != nil {
+			if ue, ok := err.(*UpstreamError); ok {
+				return nil, ue
+			}
+			return nil, &UpstreamError{Msg: err.Error(), Status: 502, Kind: "upstream"}
+		}
+		if cb, ok := res.Body.(*cancelBody); ok {
+			cb.release = releaseLane
+		} else {
+			res.Body = &cancelBody{ReadCloser: res.Body, release: releaseLane}
+		}
+		laneTransferred = true
+		return res, nil
 	}
 
 	var lastErr *UpstreamError
 	tried := map[string]bool{}
 	for attempt := 0; ; attempt++ {
-		var acct *candidate
-		for i := range cands {
-			key := cands[i].ID
-			if key == "" {
-				key = fmt.Sprintf("legacy#%d", i)
-			}
-			if !tried[key] {
-				acct = &cands[i]
-				tried[key] = true
-				break
-			}
-		}
-		if acct == nil {
+		storedAcct, remaining, releaseAcct, acqErr := accounts.AcquireCandidate(ctx, o.AccountID, tried)
+		if errors.Is(acqErr, accounts.ErrNoUsableAccount) {
 			break
 		}
-		res, err := runAccount(ctx, client, *acct, o, timeout)
+		if acqErr != nil {
+			return nil, &UpstreamError{Msg: "client went away", Status: 499, Kind: "upstream"}
+		}
+		tried[storedAcct.ID] = true
+		acct := candidate{
+			ID:          storedAcct.ID,
+			Label:       storedAcct.Label,
+			JWT:         storedAcct.JWT,
+			DeviceID:    storedAcct.DeviceID,
+			SessionSeed: storedAcct.SessionSeed,
+			UserID:      storedAcct.UserID,
+		}
+		hasMoreAccounts := remaining > 0
+		res, err := runAccount(ctx, client, acct, o, headerTimeout, idleTimeout, hasMoreAccounts)
 		if err == nil {
-			if acct.ID != "" {
-				accounts.ClearCooldown(acct.ID)
+			accounts.ClearCooldown(acct.ID)
+			combinedRelease := func() {
+				releaseAcct()
+				releaseLane()
 			}
+			if cb, ok := res.Body.(*cancelBody); ok {
+				cb.release = combinedRelease
+			} else {
+				res.Body = &cancelBody{ReadCloser: res.Body, release: combinedRelease}
+			}
+			laneTransferred = true
 			return res, nil
 		}
+
+		// Release the failed account's concurrency slot immediately before
+		// marking cooldown or rotating to the next candidate.
+		releaseAcct()
+
 		ue, ok := err.(*UpstreamError)
 		if !ok {
 			ue = &UpstreamError{Msg: err.Error(), Status: 502, Kind: "upstream"}
@@ -368,17 +504,22 @@ func SendAnthropic(o SendOpts) (*http.Response, error) {
 		if !ue.AccountSwitch {
 			return nil, ue // global failure: no point switching
 		}
-		if acct.ID != "" {
-			switch {
-			case ue.Status == 401 || ue.Status == 403:
-				accounts.MarkReauth(acct.ID)
-			case ue.Code == float64(1113) || ue.Status == http.StatusTooManyRequests:
-				accounts.MarkCooldown(acct.ID, 0)
-			default:
-				accounts.MarkCooldown(acct.ID, 2*time.Minute)
+		switch {
+		case ue.Status == http.StatusUnauthorized || ue.Status == http.StatusForbidden:
+			accounts.MarkReauth(acct.ID)
+		case codeIs(ue.Code, 3008):
+			// 3008 is transient account concurrency (desktop app active), not
+			// quota exhaustion. Never lock out a single-account setup; when
+			// multiple accounts exist, apply only a brief cooldown so the next
+			// request prefers an idle account.
+			if attempt > 0 || remaining > 0 {
+				accounts.MarkCooldown(acct.ID, concurrencyCooldown())
 			}
+		case codeIs(ue.Code, 1113) || (ue.Status == http.StatusTooManyRequests && !codeIs(ue.Code, 3009)):
+			accounts.MarkCooldown(acct.ID, 0)
+		default:
+			accounts.MarkCooldown(acct.ID, 2*time.Minute)
 		}
-		_ = attempt
 	}
 	if lastErr != nil {
 		return nil, lastErr
@@ -387,8 +528,8 @@ func SendAnthropic(o SendOpts) (*http.Response, error) {
 }
 
 // runAccount runs one account's turn: transient retries in place, one
-// refresh on 401, then a switchable error => throw for rotation.
-func runAccount(ctx context.Context, client *http.Client, acct candidate, o SendOpts, timeout time.Duration) (*http.Response, error) {
+// singleflight refresh on 401, then a switchable error => throw for rotation.
+func runAccount(ctx context.Context, client *http.Client, acct candidate, o SendOpts, headerTimeout, idleTimeout time.Duration, hasMoreAccounts bool) (*http.Response, error) {
 	maxAttempts := 3
 	if v := osGetenv("ZCODE_MAX_ATTEMPTS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -405,7 +546,7 @@ func runAccount(ctx context.Context, client *http.Client, acct candidate, o Send
 	refreshed := false
 	var lastErr *UpstreamError
 	for n := 0; n < maxAttempts; n++ {
-		res, attemptErr := attemptOnce(ctx, client, acct, bearer, o, timeout)
+		res, attemptErr := attemptOnce(ctx, client, acct, bearer, o, headerTimeout, idleTimeout)
 		if res != nil && res.StatusCode >= 200 && res.StatusCode < 300 {
 			return res, nil
 		}
@@ -427,33 +568,21 @@ func runAccount(ctx context.Context, client *http.Client, acct candidate, o Send
 				lastErr.AccountSwitch = true
 			}
 		}
-		// 401 handling: a stored account gets one best-effort refresh; the
-		// legacy token re-reads its sources (the desktop app may have
-		// rotated the JWT underneath us). Either way the retry does not
-		// consume the transient budget. Runs before the switch return so
-		// a revoked-then-refreshed account recovers in place.
+		// 401 handling: a stored account gets one singleflight refresh (shared
+		// across concurrent requests for the same account); the legacy token
+		// re-reads its sources (the desktop app may have rotated the JWT
+		// underneath us). Either way the retry does not consume the transient
+		// budget. Runs before the switch return so a revoked-then-refreshed
+		// account recovers in place.
 		if lastErr.Status == http.StatusUnauthorized && !refreshed {
 			refreshed = true
 			handled := false
 			switch {
 			case acct.ID != "":
-				for _, a := range accounts.List() {
-					if a.ID == acct.ID {
-						if fresh, err := auth.RefreshPlanJWT(ctx, a.RefreshToken); err == nil {
-							claims, _ := auth.DecodeJWT(fresh.JWT)
-							var exp int64
-							if claims != nil {
-								if e, ok := claims["exp"].(float64); ok {
-									exp = int64(e) * 1000
-								}
-							}
-							accounts.Upsert(acct.ID, acct.Label, fresh.JWT, fresh.RefreshToken, fresh.AccessToken, exp)
-							bearer = fresh.JWT
-							handled = true
-							n--
-						}
-						break
-					}
+				if freshJWT, _, err := accounts.RefreshAccountSingleflight(ctx, acct.ID, bearer); err == nil && freshJWT != "" {
+					bearer = freshJWT
+					handled = true
+					n--
 				}
 			case o.JWT == "":
 				if fresh := auth.ResolvePlanJWT(""); fresh != "" && fresh != bearer {
@@ -466,7 +595,10 @@ func runAccount(ctx context.Context, client *http.Client, acct candidate, o Send
 				continue
 			}
 		}
-		if lastErr.AccountSwitch {
+		// For 3008 (account concurrency), switch immediately if another healthy
+		// account is waiting in the ring; otherwise stay and use the bounded
+		// in-place retry budget before giving up.
+		if lastErr.AccountSwitch && (!codeIs(lastErr.Code, 3008) || hasMoreAccounts) {
 			return nil, lastErr
 		}
 		if !isTransient(lastErr) || n >= maxAttempts-1 {
@@ -484,8 +616,10 @@ func runAccount(ctx context.Context, client *http.Client, acct candidate, o Send
 	return nil, lastErr
 }
 
-// attemptOnce performs one upstream POST.
-func attemptOnce(ctx context.Context, client *http.Client, acct candidate, bearer string, o SendOpts, timeout time.Duration) (*http.Response, error) {
+// attemptOnce performs one upstream POST with a response-header deadline and
+// an activity-based stream idle timeout (so long active streams are never cut
+// short by a fixed wall-clock timeout).
+func attemptOnce(ctx context.Context, client *http.Client, acct candidate, bearer string, o SendOpts, headerTimeout, idleTimeout time.Duration) (*http.Response, error) {
 	deviceID := firstNonEmpty(acct.DeviceID, identity.ResolveDeviceMid(), newUUID())
 	sessionID := systemprompt.SessionIDFor(o.ClientSessionID, acct.SessionSeed)
 	requestID := newUUID()
@@ -511,14 +645,13 @@ func attemptOnce(ctx context.Context, client *http.Client, acct candidate, beare
 		return nil, &UpstreamError{Msg: "marshal body: " + err.Error(), Status: 500, Kind: "config"}
 	}
 
-	// The lane is a process-wide queue, so one hung upstream socket would
-	// stall every later request behind it. Race a hard deadline against the
-	// caller's context (AbortSignal.any equivalent).
-	callCtx, cancel := context.WithTimeout(ctx, timeout)
-	// NO deferred cancel: the response body keeps streaming after this
-	// function returns, and canceling here would kill it mid-flight. The
-	// returned body is wrapped so cancel runs when the consumer closes it.
-	req, err := http.NewRequestWithContext(callCtx, http.MethodPost, InferenceOrigin+PlanAnthropicPath, bytes.NewReader(raw))
+	baseOrigin, err := auth.ValidateOriginURL(InferenceOrigin)
+	if err != nil {
+		return nil, &UpstreamError{Msg: "invalid inference origin: " + err.Error(), Status: 500, Kind: "config"}
+	}
+
+	callCtx, cancel := context.WithCancel(ctx)
+	req, err := http.NewRequestWithContext(callCtx, http.MethodPost, baseOrigin+PlanAnthropicPath, bytes.NewReader(raw))
 	if err != nil {
 		cancel()
 		return nil, &UpstreamError{Msg: "build request: " + err.Error(), Status: 500, Kind: "config"}
@@ -526,28 +659,107 @@ func attemptOnce(ctx context.Context, client *http.Client, acct candidate, beare
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
+
+	var hdrTimedOut atomic.Bool
+	var hdrTimer *time.Timer
+	if headerTimeout > 0 {
+		hdrTimer = time.AfterFunc(headerTimeout, func() {
+			hdrTimedOut.Store(true)
+			cancel()
+		})
+	}
 	resp, err := client.Do(req)
+	if hdrTimer != nil {
+		hdrTimer.Stop()
+	}
 	if err != nil {
 		cancel()
-		if callCtx.Err() != nil && ctx.Err() == nil {
+		if (hdrTimedOut.Load() || callCtx.Err() != nil) && ctx.Err() == nil {
 			return nil, &UpstreamError{Msg: "upstream timeout", Status: 504, Kind: "upstream"}
 		}
-		return nil, &UpstreamError{Msg: "upstream fetch failed: " + err.Error(), Status: 502, Kind: "upstream"}
+		return nil, &UpstreamError{Msg: "upstream fetch failed: " + auth.RedactSecrets(err.Error(), bearer), Status: 502, Kind: "upstream"}
 	}
-	resp.Body = &cancelBody{ReadCloser: resp.Body, cancel: cancel}
+	resp.Body = &cancelBody{
+		ReadCloser:  resp.Body,
+		parentCtx:   ctx,
+		cancel:      cancel,
+		idleTimeout: idleTimeout,
+	}
 	return resp, nil
 }
 
-// cancelBody runs the request cancel when the consumer closes the body —
-// the Go equivalent of letting the fetch signal live until the stream ends.
+// cancelBody runs the request cancel when the consumer closes the body and
+// enforces a per-Read inactivity timeout without limiting total stream duration.
 type cancelBody struct {
 	io.ReadCloser
-	cancel context.CancelFunc
-	once   sync.Once
+	parentCtx   context.Context
+	cancel      context.CancelFunc
+	idleTimeout time.Duration
+	release     func()
+
+	timerMu  sync.Mutex
+	timer    *time.Timer
+	closed   bool
+	timedOut atomic.Bool
+	once     sync.Once
+}
+
+func (b *cancelBody) Read(p []byte) (int, error) {
+	if b.idleTimeout > 0 {
+		if !b.armIdleTimer() {
+			return 0, io.EOF
+		}
+		defer b.disarmIdleTimer()
+	}
+	n, err := b.ReadCloser.Read(p)
+	if err != nil && b.timedOut.Load() && (b.parentCtx == nil || b.parentCtx.Err() == nil) {
+		return n, ErrStreamIdleTimeout
+	}
+	return n, err
+}
+
+func (b *cancelBody) armIdleTimer() bool {
+	b.timerMu.Lock()
+	defer b.timerMu.Unlock()
+	if b.closed {
+		return false
+	}
+	if b.timer == nil {
+		b.timer = time.AfterFunc(b.idleTimeout, func() {
+			b.timedOut.Store(true)
+			if b.cancel != nil {
+				b.cancel()
+			}
+		})
+	} else {
+		b.timer.Reset(b.idleTimeout)
+	}
+	return true
+}
+
+func (b *cancelBody) disarmIdleTimer() {
+	b.timerMu.Lock()
+	defer b.timerMu.Unlock()
+	if b.timer != nil {
+		b.timer.Stop()
+	}
 }
 
 func (b *cancelBody) Close() error {
-	b.once.Do(b.cancel)
+	b.once.Do(func() {
+		b.timerMu.Lock()
+		b.closed = true
+		if b.timer != nil {
+			b.timer.Stop()
+		}
+		b.timerMu.Unlock()
+		if b.cancel != nil {
+			b.cancel()
+		}
+		if b.release != nil {
+			b.release()
+		}
+	})
 	return b.ReadCloser.Close()
 }
 
@@ -567,3 +779,189 @@ func firstNonEmpty(vals ...string) string {
 
 // osGetenv exists so tests can stub the environment.
 var osGetenv = os.Getenv
+
+// DefaultMaxSSEEventBytes caps the memory a single SSE event may buffer.
+const DefaultMaxSSEEventBytes = 2 << 20
+
+// ErrSSEEventTooLarge is returned when an upstream SSE stream exceeds the
+// configured per-event buffer limit without terminating the event.
+var ErrSSEEventTooLarge = errors.New("upstream SSE event exceeded buffer limit")
+
+// SSEEvent represents one parsed Server-Sent Event frame.
+type SSEEvent struct {
+	Event string
+	Data  string
+}
+
+var (
+	sseFieldEvent = []byte("event")
+	sseFieldData  = []byte("data")
+)
+
+// SSEReader parses an SSE stream across arbitrary chunk boundaries,
+// supporting LF, CRLF, and CR line endings, multiline data fields, and a hard
+// per-event buffer bound.
+type SSEReader struct {
+	r             io.Reader
+	maxEventBytes int
+	readBuf       [4 << 10]byte
+	pos           int
+	end           int
+	pendingCR     bool
+	eof           bool
+	readErr       error
+
+	lineBuf    bytes.Buffer
+	dataBuf    bytes.Buffer
+	eventType  string
+	hasData    bool
+	eventBytes int
+}
+
+// NewSSEReader returns a bounded SSE event reader. If maxEventBytes <= 0,
+// DefaultMaxSSEEventBytes (2 MiB) is used.
+func NewSSEReader(r io.Reader, maxEventBytes int) *SSEReader {
+	if maxEventBytes <= 0 {
+		maxEventBytes = DefaultMaxSSEEventBytes
+	}
+	return &SSEReader{r: r, maxEventBytes: maxEventBytes}
+}
+
+// Next reads and returns the next non-empty SSE event from the stream, or
+// io.EOF when the stream ends cleanly.
+func (s *SSEReader) Next() (SSEEvent, error) {
+	for {
+		line, hasLine, err := s.readLine()
+		if hasLine {
+			if len(line) == 0 {
+				if s.hasData || s.eventType != "" {
+					ev := SSEEvent{Event: s.eventType, Data: s.dataBuf.String()}
+					s.resetEvent()
+					return ev, nil
+				}
+			} else if err := s.consumeLine(line); err != nil {
+				s.resetEvent()
+				return SSEEvent{}, err
+			}
+		}
+		if err != nil {
+			if err == io.EOF && (s.hasData || s.eventType != "") {
+				ev := SSEEvent{Event: s.eventType, Data: s.dataBuf.String()}
+				s.resetEvent()
+				return ev, nil
+			}
+			s.resetEvent()
+			return SSEEvent{}, err
+		}
+	}
+}
+
+func (s *SSEReader) resetEvent() {
+	s.eventType = ""
+	s.dataBuf.Reset()
+	s.hasData = false
+	s.eventBytes = 0
+}
+
+func (s *SSEReader) consumeLine(line []byte) error {
+	s.eventBytes += len(line)
+	if s.eventBytes > s.maxEventBytes {
+		return ErrSSEEventTooLarge
+	}
+	if line[0] == ':' {
+		return nil // SSE comment
+	}
+	field, val, hasColon := bytes.Cut(line, []byte{':'})
+	if hasColon && len(val) > 0 && val[0] == ' ' {
+		val = val[1:]
+	}
+	if bytes.Equal(field, sseFieldData) {
+		if s.hasData {
+			s.dataBuf.WriteByte('\n')
+		}
+		s.dataBuf.Write(val)
+		s.hasData = true
+	} else if bytes.Equal(field, sseFieldEvent) {
+		s.eventType = string(bytes.TrimSpace(val))
+	}
+	return nil
+}
+
+func (s *SSEReader) readLine() ([]byte, bool, error) {
+	s.lineBuf.Reset()
+	for {
+		if s.pos >= s.end {
+			if s.eof {
+				if s.lineBuf.Len() > 0 {
+					out := s.lineBuf.Bytes()
+					return out, true, nil
+				}
+				return nil, false, io.EOF
+			}
+			if s.readErr != nil {
+				err := s.readErr
+				s.readErr = nil
+				if s.lineBuf.Len() > 0 {
+					out := s.lineBuf.Bytes()
+					return out, true, err
+				}
+				return nil, false, err
+			}
+			n, err := s.r.Read(s.readBuf[:])
+			s.pos = 0
+			s.end = n
+			if err != nil {
+				if err == io.EOF {
+					s.eof = true
+				} else {
+					s.readErr = err
+				}
+			}
+			if n == 0 {
+				continue
+			}
+		}
+
+		if s.pendingCR {
+			s.pendingCR = false
+			if s.readBuf[s.pos] == '\n' {
+				s.pos++
+				if s.pos >= s.end {
+					continue
+				}
+			}
+		}
+
+		rem := s.readBuf[s.pos:s.end]
+		eol := -1
+		var delim byte
+		for i := 0; i < len(rem); i++ {
+			if rem[i] == '\n' || rem[i] == '\r' {
+				eol = i
+				delim = rem[i]
+				break
+			}
+		}
+
+		if eol >= 0 {
+			if s.lineBuf.Len()+eol+s.eventBytes > s.maxEventBytes {
+				return nil, false, ErrSSEEventTooLarge
+			}
+			s.pos += eol + 1
+			if delim == '\r' {
+				s.pendingCR = true
+			}
+			if s.lineBuf.Len() == 0 {
+				return rem[:eol], true, nil
+			}
+			s.lineBuf.Write(rem[:eol])
+			return s.lineBuf.Bytes(), true, nil
+		}
+
+		if s.lineBuf.Len()+len(rem)+s.eventBytes > s.maxEventBytes {
+			return nil, false, ErrSSEEventTooLarge
+		}
+		s.lineBuf.Write(rem)
+		s.pos = s.end
+	}
+}

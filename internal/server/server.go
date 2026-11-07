@@ -15,21 +15,44 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/apissaj/zcode-gateway/internal/accounts"
+	"github.com/apissaj/zcode-gateway/internal/auth"
 	"github.com/apissaj/zcode-gateway/internal/models"
 	"github.com/apissaj/zcode-gateway/internal/quota"
 	"github.com/apissaj/zcode-gateway/internal/transport"
 )
 
-const maxBodyBytes = 32 << 20
+const (
+	DefaultMaxBodyBytes      int64   = 32 << 20 // 32 MiB
+	DefaultMaxHeaderBytes    int     = 64 << 10 // 64 KiB
+	DefaultReadHeaderTimeout         = 10 * time.Second
+	DefaultBodyReadTimeout           = 30 * time.Second
+	DefaultServerIdleTimeout         = 66 * time.Second
+	DefaultShutdownTimeout           = 15 * time.Second
+	DefaultRateLimitRPS      float64 = 20
+	DefaultRateLimitBurst    int     = 40
+)
+
+var (
+	errBodyReadTimeout = errors.New("request body read timeout")
+	reqCounter         uint64
+)
 
 // Config is the server's runtime configuration.
 type Config struct {
@@ -37,16 +60,125 @@ type Config struct {
 	Host        string
 	BridgeToken string
 	ModelsCache time.Duration
+	LogFunc     func(format string, args ...any)
 }
 
-var cfg Config
+var (
+	cfgMu sync.RWMutex
+	cfg   = Config{Host: "127.0.0.1", Port: 20131, ModelsCache: 30 * time.Second}
+)
+
+var hostnamePattern = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$`)
+
+// ResolveBindHost resolves the network bind address from environment variables.
+// Priority: BIND_HOST -> HOST -> "127.0.0.1".
+func ResolveBindHost() string {
+	if v := strings.TrimSpace(os.Getenv("BIND_HOST")); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(os.Getenv("HOST")); v != "" {
+		return v
+	}
+	return "127.0.0.1"
+}
+
+// ValidateHost validates that host is a syntactically valid IP address or hostname
+// without scheme, path, or port components.
+func ValidateHost(host string) error {
+	h := strings.TrimSpace(host)
+	if h == "" {
+		return errors.New("bind host must not be empty")
+	}
+	if strings.HasPrefix(h, "[") && strings.HasSuffix(h, "]") {
+		h = h[1 : len(h)-1]
+	}
+	if strings.ContainsAny(h, " \t\r\n/\\?#@") {
+		return fmt.Errorf("invalid bind host %q", host)
+	}
+	if ip := net.ParseIP(h); ip != nil {
+		return nil
+	}
+	if strings.Contains(h, ":") {
+		return fmt.Errorf("invalid bind host %q (must not include port or malformed IPv6)", host)
+	}
+	if looksNumericIPv4(h) {
+		return fmt.Errorf("invalid IPv4 bind host %q", host)
+	}
+	if len(h) > 253 || !hostnamePattern.MatchString(h) {
+		return fmt.Errorf("invalid bind host %q", host)
+	}
+	return nil
+}
+
+func looksNumericIPv4(h string) bool {
+	parts := strings.Split(h, ".")
+	for _, p := range parts {
+		if p == "" {
+			return true
+		}
+		for i := 0; i < len(p); i++ {
+			if p[i] < '0' || p[i] > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// IsLoopbackHost reports whether host refers exclusively to the local loopback interface.
+func IsLoopbackHost(host string) bool {
+	h := strings.TrimSpace(host)
+	if strings.HasPrefix(h, "[") && strings.HasSuffix(h, "]") {
+		h = h[1 : len(h)-1]
+	}
+	if strings.EqualFold(h, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(h); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+// ValidateConfig enforces network binding and authentication invariants before startup.
+func ValidateConfig(c Config) error {
+	if err := ValidateHost(c.Host); err != nil {
+		return err
+	}
+	if c.Port < 0 || c.Port > 65535 {
+		return fmt.Errorf("invalid port %d", c.Port)
+	}
+	if !IsLoopbackHost(c.Host) && strings.TrimSpace(c.BridgeToken) == "" {
+		return fmt.Errorf("refusing to bind non-loopback host %q without ZCODE_BRIDGE_TOKEN", c.Host)
+	}
+	return nil
+}
 
 // Configure sets the package-level config before ListenAndServe.
 func Configure(c Config) {
+	if strings.TrimSpace(c.Host) == "" {
+		c.Host = "127.0.0.1"
+	}
 	if c.ModelsCache <= 0 {
 		c.ModelsCache = 30 * time.Second
 	}
+	cfgMu.Lock()
 	cfg = c
+	cfgMu.Unlock()
+	modelsMu.Lock()
+	modelsCache = nil
+	modelsMu.Unlock()
+	resetRateLimiter()
+}
+
+func getConfig() Config {
+	cfgMu.RLock()
+	defer cfgMu.RUnlock()
+	return cfg
+}
+
+func redactMsg(msg string) string {
+	return auth.RedactSecrets(msg, getConfig().BridgeToken)
 }
 
 func sendJSON(w http.ResponseWriter, status int, payload any) {
@@ -62,30 +194,170 @@ func anthropicError(w http.ResponseWriter, status int, message, typ string) {
 	if typ == "" {
 		typ = "api_error"
 	}
-	sendJSON(w, status, map[string]any{"type": "error", "error": map[string]any{"type": typ, "message": message}})
+	sendJSON(w, status, map[string]any{"type": "error", "error": map[string]any{"type": typ, "message": redactMsg(message)}})
 }
 
 func openAIError(w http.ResponseWriter, status int, message string, code any) {
-	sendJSON(w, status, map[string]any{"error": map[string]any{"message": message, "type": "invalid_request_error", "code": code}})
+	typ := "invalid_request_error"
+	if status == http.StatusUnauthorized {
+		typ = "authentication_error"
+	} else if status == http.StatusForbidden {
+		typ = "permission_error"
+	} else if status == http.StatusNotFound {
+		typ = "not_found_error"
+	} else if status == http.StatusTooManyRequests {
+		typ = "rate_limit_error"
+	} else if status >= 500 {
+		typ = "api_error"
+	}
+	openAIErrorWithType(w, status, message, typ, code)
+}
+
+func openAIErrorWithType(w http.ResponseWriter, status int, message, typ string, code any) {
+	if typ == "" {
+		typ = "api_error"
+	}
+	sendJSON(w, status, map[string]any{"error": map[string]any{"message": redactMsg(message), "type": typ, "code": code}})
+}
+
+func constantTimeTokenEqual(presented, expected string) bool {
+	if expected == "" || presented == "" {
+		return false
+	}
+	ph := sha256.Sum256([]byte(presented))
+	eh := sha256.Sum256([]byte(expected))
+	hashEq := subtle.ConstantTimeCompare(ph[:], eh[:])
+	lenEq := subtle.ConstantTimeEq(int32(len(presented)), int32(len(expected)))
+	return (hashEq & lenEq) == 1
 }
 
 func authorized(r *http.Request) bool {
-	if cfg.BridgeToken == "" {
-		return true
+	expected := strings.TrimSpace(getConfig().BridgeToken)
+	if expected == "" {
+		return IsLoopbackHost(getConfig().Host)
 	}
 	header := r.Header.Get("Authorization")
 	presented := ""
-	if strings.HasPrefix(strings.ToLower(header), "bearer ") {
+	if len(header) >= 7 && strings.EqualFold(header[:7], "bearer ") {
 		presented = strings.TrimSpace(header[7:])
 	}
 	if presented == "" {
 		presented = strings.TrimSpace(r.Header.Get("X-Api-Key"))
 	}
-	return presented == cfg.BridgeToken
+	return constantTimeTokenEqual(presented, expected)
 }
 
-func readBody(r *http.Request) ([]byte, error) {
-	return io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
+func maxBodyBytesLimit() int64 {
+	if v := strings.TrimSpace(os.Getenv("ZCODE_MAX_BODY_BYTES")); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	return DefaultMaxBodyBytes
+}
+
+func maxHeaderBytesLimit() int {
+	if v := strings.TrimSpace(os.Getenv("ZCODE_MAX_HEADER_BYTES")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return DefaultMaxHeaderBytes
+}
+
+func readHeaderTimeout() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("ZCODE_READ_HEADER_TIMEOUT_MS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Millisecond
+		}
+	}
+	return DefaultReadHeaderTimeout
+}
+
+func bodyReadTimeout() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("ZCODE_BODY_READ_TIMEOUT_MS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Millisecond
+		}
+	}
+	return DefaultBodyReadTimeout
+}
+
+func serverIdleTimeout() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("ZCODE_SERVER_IDLE_TIMEOUT_MS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Millisecond
+		}
+	}
+	return DefaultServerIdleTimeout
+}
+
+// ShutdownTimeout resolves the graceful shutdown deadline from ZCODE_SHUTDOWN_TIMEOUT_MS.
+func ShutdownTimeout() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("ZCODE_SHUTDOWN_TIMEOUT_MS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Millisecond
+		}
+	}
+	return DefaultShutdownTimeout
+}
+
+// readBody enforces both a maximum byte size (http.MaxBytesReader) and a
+// bounded body-read deadline that is cleared before streaming begins so long
+// SSE responses are never interrupted.
+func readBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+	limit := maxBodyBytesLimit()
+	timeout := bodyReadTimeout()
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+
+	rc := http.NewResponseController(w)
+	if err := rc.SetReadDeadline(time.Now().Add(timeout)); err == nil {
+		defer func() {
+			// Clear the socket read deadline so long-lived SSE streams are not cut.
+			_ = rc.SetReadDeadline(time.Time{})
+		}()
+		data, readErr := io.ReadAll(r.Body)
+		if isTimeoutErr(readErr) {
+			return nil, errBodyReadTimeout
+		}
+		return data, readErr
+	}
+
+	// Fallback when ResponseWriter does not support SetReadDeadline (e.g. httptest.ResponseRecorder).
+	type readResult struct {
+		data []byte
+		err  error
+	}
+	ch := make(chan readResult, 1)
+	body := r.Body
+	go func() {
+		b, err := io.ReadAll(body)
+		ch <- readResult{data: b, err: err}
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case res := <-ch:
+		return res.data, res.err
+	case <-timer.C:
+		// SEC-02 remediation: Close body to unblock background io.ReadAll goroutine
+		_ = body.Close()
+		return nil, errBodyReadTimeout
+	case <-r.Context().Done():
+		_ = body.Close()
+		return nil, r.Context().Err()
+	}
+}
+
+func isTimeoutErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	return errors.Is(err, os.ErrDeadlineExceeded)
 }
 
 func parseJSON(raw []byte) (map[string]any, bool) {
@@ -99,9 +371,18 @@ func parseJSON(raw []byte) (map[string]any, bool) {
 // SessionKeyFor derives the conversation affinity key. The gateway meters
 // plan usage per session and flags brand-new session churn, so one client
 // conversation must keep one derived session_<32hex> (see
-// systemprompt.SessionIDFor). Sources, in order: OpenAI `user`, Anthropic
-// metadata.user_id (the desktop shape carries session_id inside), a caller
-// x-session-id header, else the first user turn + conversation size.
+// systemprompt.SessionIDFor).
+//
+// Sources, in order:
+//  1. OpenAI `user` field.
+//  2. Anthropic `metadata.user_id` (extracting embedded `session_id` when present).
+//  3. Caller `X-Session-Id` header.
+//  4. Anonymous fallback: SHA-256 digest of the conversation's opening anchor
+//     (system prompt + first user message), excluding message count so the key
+//     remains stable across subsequent turns and never embeds raw prompt text.
+//     Note: two anonymous conversations that start with an identical system
+//     prompt and identical first user turn will share this fallback key unless
+//     the caller supplies `user`, `metadata.user_id`, or `X-Session-Id`.
 func SessionKeyFor(r *http.Request, body map[string]any) string {
 	if u, ok := body["user"].(string); ok && strings.TrimSpace(u) != "" {
 		return strings.TrimSpace(u)
@@ -115,26 +396,66 @@ func SessionKeyFor(r *http.Request, body map[string]any) string {
 			return strings.TrimSpace(uid)
 		}
 	}
-	if inbound := r.Header.Get("X-Session-Id"); strings.TrimSpace(inbound) != "" {
-		return strings.TrimSpace(inbound)
-	}
-	msgs, _ := body["messages"].([]any)
-	first := ""
-	for _, m := range msgs {
-		if mm, ok := m.(map[string]any); ok && mm["role"] == "user" {
-			if c, ok := mm["content"].(string); ok {
-				first = c
-			} else {
-				raw, _ := json.Marshal(mm["content"])
-				first = string(raw)
-			}
-			break
+	if r != nil {
+		if inbound := r.Header.Get("X-Session-Id"); strings.TrimSpace(inbound) != "" {
+			return strings.TrimSpace(inbound)
 		}
 	}
-	if len(first) > 384 {
-		first = first[:384]
+
+	var stackBuf [512]byte
+	buf := stackBuf[:0]
+	hasSys := false
+	if topSys := canonicalContentString(body["system"]); topSys != "" {
+		buf = append(buf, topSys...)
+		hasSys = true
 	}
-	return fmt.Sprintf("anon:%s:%d", first, len(msgs))
+	msgs, _ := body["messages"].([]any)
+	firstUser := ""
+	for _, m := range msgs {
+		mm, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := mm["role"].(string)
+		switch role {
+		case "system", "developer":
+			if s := canonicalContentString(mm["content"]); s != "" {
+				if hasSys {
+					buf = append(buf, '\n')
+				}
+				buf = append(buf, s...)
+				hasSys = true
+			}
+		case "user":
+			if firstUser == "" {
+				firstUser = canonicalContentString(mm["content"])
+			}
+		}
+	}
+	if !hasSys && firstUser == "" {
+		return ""
+	}
+	buf = append(buf, 0)
+	buf = append(buf, firstUser...)
+	sum := sha256.Sum256(buf)
+	var out [37]byte
+	copy(out[:5], "anon:")
+	hex.Encode(out[5:], sum[:16])
+	return string(out[:])
+}
+
+func canonicalContentString(v any) string {
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return strings.TrimSpace(s)
+	}
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return ""
+	}
+	return string(raw)
 }
 
 // extractJSONField pulls one top-level string field out of an embedded JSON
@@ -158,10 +479,13 @@ func extractJSONField(s, field string) string {
 	return rest[:k]
 }
 
-// relayUpstreamError copies an upstream error into the caller's dialect.
+// relayUpstreamError maps an upstream error into the caller's dialect.
+// Provider authentication failures (401/403 from Z.ai) are mapped to 502 Bad
+// Gateway so clients and routers never mistake an expired upstream ZCode JWT
+// for an invalid local ZCODE_BRIDGE_TOKEN.
 func relayUpstreamError(w http.ResponseWriter, err error, dialect string) {
 	message := err.Error()
-	status := 502
+	status := http.StatusBadGateway
 	var code any
 	if ue, ok := err.(*transport.UpstreamError); ok {
 		if ue.Status > 0 {
@@ -169,15 +493,46 @@ func relayUpstreamError(w http.ResponseWriter, err error, dialect string) {
 		}
 		code = ue.Code
 	}
+
+	typ := "api_error"
+	switch {
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		status = http.StatusBadGateway
+		typ = "upstream_authentication_error"
+		message = "upstream provider authentication failed (re-run zcode-gateway login): " + message
+	case isCode(code, 1113):
+		if status < 400 {
+			status = http.StatusTooManyRequests
+		}
+		if dialect == "openai" {
+			typ = "insufficient_quota"
+		} else {
+			typ = "rate_limit_error"
+		}
+	case isCode(code, 3008) || isCode(code, 3009) || isCode(code, 3012) || status == http.StatusTooManyRequests:
+		typ = "rate_limit_error"
+	case status == http.StatusGatewayTimeout:
+		typ = "timeout_error"
+	case status >= 400 && status < 500:
+		typ = "invalid_request_error"
+	}
+
+	if status == http.StatusGatewayTimeout {
+		setEventTag(w, "upstream_timeout")
+	} else {
+		setEventTag(w, "upstream_error")
+	}
+
 	if dialect == "openai" {
-		openAIError(w, status, message, code)
+		openAIErrorWithType(w, status, message, typ, code)
 		return
 	}
-	typ := "api_error"
-	if f, ok := code.(float64); ok && f == 3012 {
-		typ = "rate_limit_error"
-	}
 	anthropicError(w, status, message, typ)
+}
+
+func isCode(code any, want float64) bool {
+	f, ok := code.(float64)
+	return ok && f == want
 }
 
 // handleMessages serves POST /v1/messages (Anthropic dialect).
@@ -260,21 +615,20 @@ func isJSON(raw []byte) bool {
 	return json.Unmarshal(raw, &m) == nil
 }
 
-// pipeStream streams upstream SSE frames to the caller. Anthropic frames
-// pass through untouched; OpenAI callers get frames rewritten into
-// chat.completion.chunk.
+// pipeStream streams upstream SSE frames to the caller using the bounded
+// transport.SSEReader. Anthropic frames are forwarded with error redaction;
+// OpenAI callers get frames rewritten into chat.completion.chunk.
 func pipeStream(w http.ResponseWriter, upstream *http.Response, dialect, model string) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(200)
+	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
 
-	reader := upstream.Body
-	buf := make([]byte, 16<<10)
-	var carry string
 	streamState := &chunkState{toolByBlock: map[float64]int{}, nextToolIndex: 0}
+	sse := transport.NewSSEReader(upstream.Body, 0)
+	doneSent := false
 
 	writeSSE := func(frame string) bool {
 		if _, err := io.WriteString(w, frame); err != nil {
@@ -286,116 +640,128 @@ func pipeStream(w http.ResponseWriter, upstream *http.Response, dialect, model s
 		return true
 	}
 
-	for {
-		n, err := reader.Read(buf)
-		if n > 0 {
-			carry += string(buf[:n])
-			if dialect != "openai" {
-				if !writeSSE(string(buf[:n])) {
-					return
-				}
-				carry = ""
-			} else {
-				for {
-					idx := strings.Index(carry, "\n\n")
-					if idx < 0 {
-						break
-					}
-					frame := carry[:idx]
-					carry = carry[idx+2:]
-					var dataLine string
-					for _, line := range strings.Split(frame, "\n") {
-						if strings.HasPrefix(line, "data:") {
-							dataLine = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-							break
-						}
-					}
-					if dataLine == "" || dataLine == "[DONE]" {
-						continue
-					}
-					var event map[string]any
-					if json.Unmarshal([]byte(dataLine), &event) != nil {
-						continue
-					}
-					if chunk := toOpenAIChunk(event, model, streamState); chunk != nil {
-						encoded, _ := json.Marshal(chunk)
-						if !writeSSE("data: " + string(encoded) + "\n\n") {
-							return
-						}
-					}
-					if event["type"] == "message_stop" {
-						if !writeSSE("data: [DONE]\n\n") {
-							return
-						}
-					}
-				}
-			}
+	emitStreamError := func(msg, errType string) {
+		if errType == "timeout_error" {
+			setEventTag(w, "stream_idle_timeout")
+		} else {
+			setEventTag(w, "upstream_stream_error")
 		}
-		if err != nil {
-			// Drain any buffered frame before the EOF/error.
-			if dialect == "openai" {
-				if leftover := flushOpenAIFrame(carry, model, streamState); leftover != "" {
-					if !writeSSE(leftover) {
-						return
-					}
-				}
-			} else if carry != "" {
-				if !writeSSE(carry) {
-					return
-				}
+		safeMsg := redactMsg(msg)
+		if safeMsg == "" {
+			safeMsg = "upstream stream error"
+		}
+		if dialect == "openai" {
+			if errType == "" {
+				errType = "upstream_error"
 			}
+			frame, _ := json.Marshal(map[string]any{"error": map[string]any{"message": safeMsg, "type": errType}})
+			_ = writeSSE("data: " + string(frame) + "\n\n")
+			if !doneSent {
+				doneSent = true
+				_ = writeSSE("data: [DONE]\n\n")
+			}
+		} else {
+			if errType == "" {
+				errType = "api_error"
+			}
+			frame, _ := json.Marshal(map[string]any{"type": "error", "error": map[string]any{"type": errType, "message": safeMsg}})
+			_ = writeSSE("event: error\ndata: " + string(frame) + "\n\n")
+		}
+	}
+
+	for {
+		ev, err := sse.Next()
+		if err != nil {
 			if err != io.EOF {
-				// Stream aborted mid-way: report in-band.
-				if dialect == "openai" {
-					frame, _ := json.Marshal(map[string]any{"error": map[string]any{"message": err.Error(), "type": "upstream_error"}})
-					_ = writeSSE("data: " + string(frame) + "\n\n")
-				} else {
-					frame, _ := json.Marshal(map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": err.Error()}})
-					_ = writeSSE("data: " + string(frame) + "\n\n")
-				}
+				emitStreamError(err.Error(), "")
 			}
 			return
 		}
+
+		data := strings.TrimSpace(ev.Data)
+		if data == "[DONE]" {
+			if dialect == "openai" {
+				if !doneSent {
+					doneSent = true
+					if !writeSSE("data: [DONE]\n\n") {
+						return
+					}
+				}
+			} else if !writeSSE("data: [DONE]\n\n") {
+				return
+			}
+			continue
+		}
+		if data == "" {
+			continue
+		}
+
+		var event map[string]any
+		if json.Unmarshal([]byte(data), &event) != nil || event == nil {
+			if strings.EqualFold(ev.Event, "error") {
+				emitStreamError(data, "")
+				return
+			}
+			continue
+		}
+
+		if strings.EqualFold(ev.Event, "error") || stringOf(event["type"]) == "error" {
+			errMsg, errType := extractStreamError(event)
+			emitStreamError(errMsg, errType)
+			return
+		}
+
+		if dialect != "openai" {
+			var frame strings.Builder
+			if ev.Event != "" {
+				frame.WriteString("event: ")
+				frame.WriteString(ev.Event)
+				frame.WriteByte('\n')
+			}
+			for _, line := range strings.Split(ev.Data, "\n") {
+				frame.WriteString("data: ")
+				frame.WriteString(line)
+				frame.WriteByte('\n')
+			}
+			frame.WriteByte('\n')
+			if !writeSSE(frame.String()) {
+				return
+			}
+			continue
+		}
+
+		if chunk := toOpenAIChunk(event, model, streamState); chunk != nil {
+			encoded, _ := json.Marshal(chunk)
+			if !writeSSE("data: " + string(encoded) + "\n\n") {
+				return
+			}
+		}
+		if event["type"] == "message_stop" && !doneSent {
+			doneSent = true
+			if !writeSSE("data: [DONE]\n\n") {
+				return
+			}
+		}
 	}
 }
 
-// flushOpenAIFrame converts one buffered SSE frame (possibly without its
-// trailing blank line) into an OpenAI chunk write; returns the bytes to
-// write or "" when nothing translatable remains.
-func flushOpenAIFrame(frame, model string, state *chunkState) string {
-	var dataLine string
-	for _, line := range strings.Split(frame, "\n") {
-		if strings.HasPrefix(line, "data:") {
-			dataLine = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			break
+func extractStreamError(event map[string]any) (string, string) {
+	if errObj, ok := event["error"].(map[string]any); ok {
+		msg := firstNonEmpty(stringOf(errObj["message"]), stringOf(errObj["msg"]))
+		typ := stringOf(errObj["type"])
+		if msg != "" {
+			return msg, typ
 		}
 	}
-	if dataLine == "" || dataLine == "[DONE]" {
-		return ""
-	}
-	var event map[string]any
-	if json.Unmarshal([]byte(dataLine), &event) != nil {
-		return ""
-	}
-	chunk := toOpenAIChunk(event, model, state)
-	if chunk == nil {
-		if event["type"] == "message_stop" {
-			return "data: [DONE]\n\n"
-		}
-		return ""
-	}
-	encoded, _ := json.Marshal(chunk)
-	out := "data: " + string(encoded) + "\n\n"
-	if event["type"] == "message_stop" {
-		out += "data: [DONE]\n\n"
-	}
-	return out
+	return firstNonEmpty(stringOf(event["message"]), stringOf(event["msg"]), "upstream stream error"), ""
 }
 
-// chunkState tracks Anthropic block indexes -> OpenAI tool_call indexes.
+// chunkState tracks Anthropic block indexes -> OpenAI tool_call indexes and
+// preserves the upstream message ID across all chunks of a stream.
 // Anthropic numbers content blocks globally (thinking=0, tool_use=1...);
 // OpenAI expects tool_calls numbered from 0 within the message.
 type chunkState struct {
+	messageID     string
 	toolByBlock   map[float64]int
 	nextToolIndex int
 }
@@ -403,7 +769,21 @@ type chunkState struct {
 // toOpenAIChunk maps one Anthropic stream event onto an OpenAI
 // chat.completion.chunk. nil = drop the event.
 func toOpenAIChunk(event map[string]any, model string, state *chunkState) map[string]any {
+	typ := stringOf(event["type"])
+	if typ == "message_start" {
+		if msg, ok := event["message"].(map[string]any); ok {
+			if mid := stringOf(msg["id"]); mid != "" && state != nil {
+				state.messageID = mid
+			}
+		}
+	}
 	id := stringOf(event["id"])
+	if id != "" && state != nil && state.messageID == "" {
+		state.messageID = id
+	}
+	if id == "" && state != nil {
+		id = state.messageID
+	}
 	if id == "" {
 		id = "chatcmpl-stream"
 	}
@@ -413,7 +793,6 @@ func toOpenAIChunk(event map[string]any, model string, state *chunkState) map[st
 		"created": time.Now().Unix(),
 		"model":   model,
 	}
-	typ := stringOf(event["type"])
 	switch typ {
 	case "message_start":
 		base["choices"] = []any{map[string]any{"index": 0, "delta": map[string]any{"role": "assistant", "content": ""}, "finish_reason": nil}}
@@ -506,7 +885,11 @@ func liveModels(ctx context.Context) any {
 	modelsMu.Lock()
 	defer modelsMu.Unlock()
 	now := time.Now()
-	if modelsCache != nil && now.Sub(modelsCache.at) < cfg.ModelsCache {
+	cacheTTL := getConfig().ModelsCache
+	if cacheTTL <= 0 {
+		cacheTTL = 30 * time.Second
+	}
+	if modelsCache != nil && now.Sub(modelsCache.at) < cacheTTL {
 		return modelsCache.list
 	}
 	var list any = staticModelList()

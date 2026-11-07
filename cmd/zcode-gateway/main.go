@@ -9,9 +9,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -37,6 +41,10 @@ func envInt(key string, fallback int) int {
 
 func main() {
 	args := os.Args[1:]
+	if len(args) > 0 && args[0] == "healthcheck" {
+		runHealthcheck(args[1:])
+		return
+	}
 	if len(args) > 0 && args[0] == "login" {
 		runLogin(args[1:])
 		return
@@ -110,7 +118,7 @@ func deviceLogin(label string) {
 	ctx := context.Background()
 	flow, err := auth.StartDeviceFlow(ctx)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "login failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "login failed: %s\n", auth.Redact(err.Error()))
 		os.Exit(1)
 	}
 	minutes := int(time.Until(flow.ExpiresAt).Minutes() + 0.5)
@@ -122,22 +130,23 @@ func deviceLogin(label string) {
 
 	result, err := auth.PollDeviceFlow(ctx, flow)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "login failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "login failed: %s\n", auth.Redact(err.Error()))
 		os.Exit(1)
 	}
 	claims, _ := auth.DecodeJWT(result.JWT)
-	var expiresAt int64
-	if e, ok := claims["exp"].(float64); ok {
-		expiresAt = int64(e) * 1000
-	} else {
-		expiresAt = time.Now().Add(24 * time.Hour).UnixMilli()
-	}
+	expiresAt, _ := auth.ExpiryUnixMilli(result.JWT)
 	userID, _ := claims["user_id"].(string)
 	if userID == "" {
 		userID, _ = claims["sub"].(string)
 	}
-	// Upsert derives the stable account id from the JWT's user_id.
-	tmp := accounts.Upsert("", label, result.JWT, result.RefreshToken, result.AccessToken, expiresAt)
+	// UpsertAccount derives the stable account id from the JWT's user_id.
+	// Plan JWTs without an `exp` claim keep expiresAt == 0 (revocation is
+	// detected via upstream 401 responses, never via a synthetic 24h timer).
+	tmp, err := accounts.UpsertAccount("", label, result.JWT, result.RefreshToken, result.AccessToken, expiresAt)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "login failed: could not persist account: %s\n", auth.Redact(err.Error()))
+		os.Exit(1)
+	}
 	fmt.Printf("\nAuthorized. account %s (user %s) stored in %s\n",
 		tmp.ID, orUnknown(userID), accounts.AccountsFile())
 	if result.RefreshToken != "" {
@@ -154,16 +163,51 @@ func orUnknown(s string) string {
 	return s
 }
 
-func serve() {
-	host := strings.TrimSpace(os.Getenv("HOST"))
-	if host == "" {
-		host = "127.0.0.1"
+func runHealthcheck(args []string) {
+	port := envInt("PORT", 20131)
+	bindHost := server.ResolveBindHost()
+	if bindHost == "0.0.0.0" || bindHost == "::" {
+		bindHost = "127.0.0.1"
 	}
+	url := fmt.Sprintf("http://%s/healthz", net.JoinHostPort(bindHost, strconv.Itoa(port)))
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "healthcheck failed: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "healthcheck failed with HTTP status %d\n", resp.StatusCode)
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+func resolveBridgeToken() string {
+	if tok := strings.TrimSpace(os.Getenv("ZCODE_BRIDGE_TOKEN")); tok != "" {
+		return tok
+	}
+	// systemd-creds support (ADR 0001): LoadCredential / LoadCredentialEncrypted
+	if credDir := strings.TrimSpace(os.Getenv("CREDENTIALS_DIRECTORY")); credDir != "" {
+		if raw, err := os.ReadFile(filepath.Join(credDir, "bridge_token")); err == nil {
+			if tok := strings.TrimSpace(string(raw)); tok != "" {
+				return tok
+			}
+		}
+	}
+	return ""
+}
+
+func serve() {
 	cfg := server.Config{
 		Port:        envInt("PORT", 20131),
-		Host:        host,
-
-		BridgeToken: strings.TrimSpace(os.Getenv("ZCODE_BRIDGE_TOKEN")),
+		Host:        server.ResolveBindHost(),
+		BridgeToken: resolveBridgeToken(),
+	}
+	if err := server.ValidateConfig(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "configuration error: %s\n", auth.RedactSecrets(err.Error(), cfg.BridgeToken))
+		os.Exit(1)
 	}
 	server.Configure(cfg)
 
@@ -182,8 +226,22 @@ func serve() {
 	if cfg.BridgeToken != "" {
 		authMode = "bridge token required"
 	}
-	fmt.Printf("zcode-gateway %s listening on %s:%d\n  lane: zcode-plan/anthropic -> %s\n  plan jwt: %s\n  device mid: %s\n  auth: %s\n",
-		version, cfg.Host, cfg.Port, transport.InferenceOrigin+transport.PlanAnthropicPath, jwtState, midState, authMode)
+	dashHost := cfg.Host
+	if dashHost == "0.0.0.0" || dashHost == "::" {
+		dashHost = "127.0.0.1"
+	}
+	dashURL := fmt.Sprintf("http://%s:%d/dashboard", dashHost, cfg.Port)
+	apiURL := fmt.Sprintf("http://%s:%d/v1", dashHost, cfg.Port)
+
+	fmt.Printf("\n  ┌────────────────────────────────────────────────────────┐\n")
+	fmt.Printf("  │ ZGate v%s (Hardened AI Gateway)                    │\n", version)
+	fmt.Printf("  │ Listener       : %s:%d\n", cfg.Host, cfg.Port)
+	fmt.Printf("  │ Web Dashboard  : %s\n", dashURL)
+	fmt.Printf("  │ API Endpoint   : %s\n", apiURL)
+	fmt.Printf("  │ Plan JWT       : %s\n", jwtState)
+	fmt.Printf("  │ Auth Mode      : %s\n", authMode)
+	fmt.Printf("  │ Upstream Lane  : %s\n", transport.InferenceOrigin+transport.PlanAnthropicPath)
+	fmt.Printf("  └────────────────────────────────────────────────────────┘\n\n")
 
 	// Background refresh: check every 15m (ZCODE_REFRESH_INTERVAL_MS),
 	// refresh accounts expiring within 2h.
@@ -201,15 +259,12 @@ func serve() {
 		}
 	}()
 
-	go func() {
-		<-ctx.Done()
-		// Give in-flight streams a moment, then leave.
-		time.Sleep(500 * time.Millisecond)
-		os.Exit(0)
-	}()
-
-	if err := server.ListenAndServe(); err != nil {
-		fmt.Fprintf(os.Stderr, "server: %v\n", err)
+	if err := server.ListenAndServeContext(ctx); err != nil {
+		if ctx.Err() != nil && errors.Is(err, context.DeadlineExceeded) {
+			fmt.Fprintln(os.Stderr, "server: graceful shutdown timeout reached; remaining connections closed")
+			return
+		}
+		fmt.Fprintf(os.Stderr, "server: %s\n", auth.RedactSecrets(err.Error(), cfg.BridgeToken))
 		os.Exit(1)
 	}
 }
@@ -227,7 +282,7 @@ func refreshExpiring(ctx context.Context) {
 		fmt.Printf("[jwt-refresh] account %s (%s) expiring — refreshing\n", a.ID, a.Label)
 		newExpiry, err := accounts.TryRefreshAccount(ctx, a.ID)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[jwt-refresh] account %s refresh failed: %v — re-login required\n", a.ID, err)
+			fmt.Fprintf(os.Stderr, "[jwt-refresh] account %s refresh failed: %s — re-login required\n", a.ID, auth.RedactSecrets(err.Error(), a.JWT, a.RefreshToken))
 			continue
 		}
 		fmt.Printf("[jwt-refresh] account %s refreshed, new expiry %s\n",

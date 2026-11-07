@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/apissaj/zcode-gateway/internal/auth"
 	"github.com/apissaj/zcode-gateway/internal/identity"
 )
 
@@ -88,16 +89,26 @@ type envelope struct {
 	Status int
 }
 
+var quotaHTTPClient = &http.Client{
+	Timeout: 20 * time.Second,
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
 func fetchEnvelope(ctx context.Context, path string, headers map[string]string) envelope {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, identity.Origin()+path, nil)
+	baseOrigin, err := auth.ValidateOriginURL(identity.Origin())
+	if err != nil {
+		return envelope{Msg: wrap(err)}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseOrigin+path, nil)
 	if err != nil {
 		return envelope{Msg: wrap(err)}
 	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	client := &http.Client{Timeout: 20 * time.Second}
-	res, err := client.Do(req)
+	res, err := quotaHTTPClient.Do(req)
 	if err != nil {
 		return envelope{Msg: wrap(err)}
 	}
@@ -110,9 +121,9 @@ func fetchEnvelope(ctx context.Context, path string, headers map[string]string) 
 	}
 	haveBody := json.Unmarshal(body, &parsed) == nil
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		msg := parsed.Msg
+		msg := auth.Redact(parsed.Msg)
 		if msg == "" {
-			msg = string(body)
+			msg = auth.Redact(string(body))
 			if len(msg) > 160 {
 				msg = msg[:160]
 			}
@@ -120,12 +131,12 @@ func fetchEnvelope(ctx context.Context, path string, headers map[string]string) 
 		return envelope{Status: res.StatusCode, Code: parsed.Code, Msg: msg}
 	}
 	if haveBody && codeNonZero(parsed.Code) {
-		return envelope{Status: res.StatusCode, Code: parsed.Code, Msg: parsed.Msg}
+		return envelope{Status: res.StatusCode, Code: parsed.Code, Msg: auth.Redact(parsed.Msg)}
 	}
-	return envelope{OK: true, Status: res.StatusCode, Code: parsed.Code, Msg: parsed.Msg, Data: parsed.Data}
+	return envelope{OK: true, Status: res.StatusCode, Code: parsed.Code, Msg: auth.Redact(parsed.Msg), Data: parsed.Data}
 }
 
-func wrap(err error) string { return err.Error() }
+func wrap(err error) string { return auth.Redact(err.Error()) }
 
 func codeNonZero(code any) bool {
 	switch v := code.(type) {
@@ -184,7 +195,7 @@ func ReadQuota(ctx context.Context, jwt, deviceMid string) (*ReadResult, error) 
 		plans, _ = balance.Data["plans"].([]any)
 		balances, _ = balance.Data["balances"].([]any)
 	} else {
-		msg := balance.Msg
+		msg := auth.RedactSecrets(balance.Msg, jwt)
 		if msg == "" {
 			msg = fmt.Sprintf("status %d", balance.Status)
 		}
@@ -202,7 +213,7 @@ func ReadQuota(ctx context.Context, jwt, deviceMid string) (*ReadResult, error) 
 				errs = append(errs, "current: empty plan list")
 			}
 		} else {
-			msg := current.Msg
+			msg := auth.RedactSecrets(current.Msg, jwt)
 			if msg == "" {
 				msg = fmt.Sprintf("status %d", current.Status)
 			}

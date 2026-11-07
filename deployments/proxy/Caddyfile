@@ -1,0 +1,45 @@
+# Production Caddy Reverse Proxy Configuration for zcode-gateway
+# Features:
+# - Automatic HTTPS via Let's Encrypt / ZeroSSL
+# - Full SSE streaming support (flush_interval -1 / unbuffered response)
+# - Host header forwarding & trusted X-Forwarded-For
+
+ai.example.com {
+    # Optional IP access allowlist for personal VPS
+    # @allowed remote_ip 198.51.100.0/24 203.0.113.10
+    # handle @allowed { ... }
+
+    # Reverse proxy to zcode-gateway local listening port
+    reverse_proxy 127.0.0.1:20131 {
+        # Keep client host header intact for DNS rebinding & Host validation
+        header_up Host {host}
+        header_up X-Forwarded-Host {host}
+
+        # CRITICAL for OpenAI & Anthropic SSE streaming:
+        # flush_interval -1 disables response buffering so tokens stream immediately
+        flush_interval -1
+
+        # Generous streaming read timeouts for deep reasoning models (e.g. GLM-5.3:max)
+        transport http {
+            read_timeout 300s
+            write_timeout 300s
+            dial_timeout 10s
+        }
+    }
+
+    # Security headers
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+
+    # Logging
+    log {
+        output file /var/log/caddy/zcode-gateway.access.log {
+            roll_size 50mb
+            roll_keep 5
+        }
+    }
+}

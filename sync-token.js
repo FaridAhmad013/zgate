@@ -27,9 +27,11 @@ try {
   if (data['zcodejwttoken']) {
     const jwt = decrypt(data['zcodejwttoken']);
     const target = path.join(__dirname, 'plan-jwt.json');
-    fs.writeFileSync(target, JSON.stringify({ jwt }), 'utf8');
+    fs.writeFileSync(target, JSON.stringify({ jwt }), { encoding: 'utf8', mode: 0o600 });
+    try { fs.chmodSync(target, 0o600); } catch (_) {}
     console.log('[sync-token] Token synced successfully');
   }
 } catch (e) {
-  console.error('[sync-token] Error syncing token:', e.message);
+  const msg = String((e && e.message) || 'unknown error').replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g, '[REDACTED_JWT]').replace(/enc:v1:[A-Za-z0-9_.-]+/g, 'enc:v1:[REDACTED]');
+  console.error('[sync-token] Error syncing token:', msg);
 }
