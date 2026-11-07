@@ -214,9 +214,11 @@ func serve() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	jwtState := "MISSING (run: zcode-gateway login)"
-	if auth.ResolvePlanJWT("") != "" {
-		jwtState = "available"
+	jwtState := "MISSING (add account in dashboard or run: zcode-gateway login)"
+	if len(accounts.Usable(nil)) > 0 {
+		jwtState = fmt.Sprintf("available (%d active accounts in pool)", len(accounts.Usable(nil)))
+	} else if auth.ResolvePlanJWT("") != "" {
+		jwtState = "available (single token)"
 	}
 	midState := identity.ResolveDeviceMid()
 	if midState == "" {
