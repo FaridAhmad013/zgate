@@ -502,6 +502,19 @@ func relayUpstreamError(w http.ResponseWriter, err error, dialect string) {
 	}
 
 	typ := "api_error"
+	if strings.Contains(strings.ToLower(message), "no zcode plan jwt available") {
+		status = http.StatusBadRequest
+		typ = "no_account_enrolled"
+		message = "No active Z.ai accounts enrolled. Please open the ZGate dashboard (https://" + extractRequestHost(w.Header().Get("Host")) + ") and click [+ ADD Z.AI ACCOUNT] to link your account."
+		setEventTag(w, "no_account_enrolled")
+		if dialect == "openai" {
+			openAIErrorWithType(w, status, message, typ, code)
+			return
+		}
+		anthropicError(w, status, message, typ)
+		return
+	}
+
 	switch {
 	case status == http.StatusUnauthorized || status == http.StatusForbidden:
 		status = http.StatusBadGateway
@@ -609,6 +622,16 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request, body map[stri
 		openAIError(w, 502, "Upstream returned a non-JSON response", nil)
 		return
 	}
+	if usage, ok := result["usage"].(map[string]any); ok {
+		var inTok, outTok int
+		if it, ok := usage["input_tokens"].(float64); ok {
+			inTok = int(it)
+		}
+		if ot, ok := usage["output_tokens"].(float64); ok {
+			outTok = int(ot)
+		}
+		setLogTelemetry(w, model, "", inTok, outTok)
+	}
 	sendJSON(w, 200, models.AnthropicToOpenAI(result, model))
 }
 
@@ -676,12 +699,14 @@ func pipeStream(w http.ResponseWriter, upstream *http.Response, dialect, model s
 		}
 	}
 
+	var inTokens, outTokens int
 	for {
 		ev, err := sse.Next()
 		if err != nil {
 			if err != io.EOF {
 				emitStreamError(err.Error(), "")
 			}
+			setLogTelemetry(w, model, "", inTokens, outTokens)
 			return
 		}
 
@@ -691,12 +716,15 @@ func pipeStream(w http.ResponseWriter, upstream *http.Response, dialect, model s
 				if !doneSent {
 					doneSent = true
 					if !writeSSE("data: [DONE]\n\n") {
+						setLogTelemetry(w, model, "", inTokens, outTokens)
 						return
 					}
 				}
 			} else if !writeSSE("data: [DONE]\n\n") {
+				setLogTelemetry(w, model, "", inTokens, outTokens)
 				return
 			}
+			setLogTelemetry(w, model, "", inTokens, outTokens)
 			continue
 		}
 		if data == "" {
@@ -710,6 +738,23 @@ func pipeStream(w http.ResponseWriter, upstream *http.Response, dialect, model s
 				return
 			}
 			continue
+		}
+
+		if event["type"] == "message_start" {
+			if msg, ok := event["message"].(map[string]any); ok {
+				if usage, ok := msg["usage"].(map[string]any); ok {
+					if it, ok := usage["input_tokens"].(float64); ok {
+						inTokens = int(it)
+					}
+				}
+			}
+		}
+		if event["type"] == "message_delta" {
+			if usage, ok := event["usage"].(map[string]any); ok {
+				if ot, ok := usage["output_tokens"].(float64); ok {
+					outTokens = int(ot)
+				}
+			}
 		}
 
 		if strings.EqualFold(ev.Event, "error") || stringOf(event["type"]) == "error" {

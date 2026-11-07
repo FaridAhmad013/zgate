@@ -35,6 +35,10 @@ type statusRecorder struct {
 	status      int
 	wroteHeader bool
 	eventTag    string
+	model       string
+	account     string
+	inTokens    int
+	outTokens   int
 }
 
 func (sr *statusRecorder) WriteHeader(code int) {
@@ -69,6 +73,23 @@ func setEventTag(w http.ResponseWriter, tag string) {
 	}
 }
 
+func setLogTelemetry(w http.ResponseWriter, model, acct string, inTok, outTok int) {
+	if sr, ok := w.(*statusRecorder); ok {
+		if model != "" {
+			sr.model = model
+		}
+		if acct != "" {
+			sr.account = acct
+		}
+		if inTok > 0 {
+			sr.inTokens = inTok
+		}
+		if outTok > 0 {
+			sr.outTokens = outTok
+		}
+	}
+}
+
 func requestIDFor(r *http.Request) string {
 	if incoming := strings.TrimSpace(r.Header.Get("X-Request-Id")); incoming != "" && len(incoming) <= 64 {
 		valid := true
@@ -91,8 +112,8 @@ func requestIDFor(r *http.Request) string {
 	return fmt.Sprintf("req_%d_%d", time.Now().UnixNano(), seq)
 }
 
-func logRequest(reqID, method, path string, status int, dur time.Duration, eventTag string) {
-	recordTrafficLog(reqID, method, path, status, dur, eventTag)
+func logRequest(reqID, method, path string, status int, dur time.Duration, eventTag, model, acct string, inTok, outTok int) {
+	recordTrafficLog(reqID, method, path, status, dur, eventTag, model, acct, inTok, outTok)
 	c := getConfig()
 	logFn := c.LogFunc
 	if logFn == nil {
@@ -112,11 +133,11 @@ func logRequest(reqID, method, path string, status int, dur time.Duration, event
 	}
 	safePath := redactMsg(path)
 	if eventTag != "" {
-		logFn("[access] req_id=%s method=%s path=%s status=%d duration_ms=%d event=%s",
-			reqID, method, safePath, status, dur.Milliseconds(), eventTag)
+		logFn("[access] req_id=%s method=%s path=%s status=%d duration_ms=%d event=%s model=%s tokens=%d/%d",
+			reqID, method, safePath, status, dur.Milliseconds(), eventTag, model, inTok, outTok)
 	} else {
-		logFn("[access] req_id=%s method=%s path=%s status=%d duration_ms=%d",
-			reqID, method, safePath, status, dur.Milliseconds())
+		logFn("[access] req_id=%s method=%s path=%s status=%d duration_ms=%d model=%s tokens=%d/%d",
+			reqID, method, safePath, status, dur.Milliseconds(), model, inTok, outTok)
 	}
 }
 
@@ -339,7 +360,7 @@ func route(origW http.ResponseWriter, r *http.Request) {
 		pathName = "/"
 	}
 	defer func() {
-		logRequest(reqID, r.Method, pathName, w.status, time.Since(start), w.eventTag)
+		logRequest(reqID, r.Method, pathName, w.status, time.Since(start), w.eventTag, w.model, w.account, w.inTokens, w.outTokens)
 	}()
 
 	reqDialect := dialectForPath(r.URL.Path)
@@ -383,6 +404,8 @@ func route(origW http.ResponseWriter, r *http.Request) {
 		handleDashboardLoginStart(w, r)
 	case r.Method == http.MethodGet && pathName == "/api/dashboard/login/poll":
 		handleDashboardLoginPoll(w, r)
+	case r.Method == http.MethodPost && pathName == "/api/dashboard/login/callback":
+		handleDashboardLoginCallback(w, r)
 	case r.Method == http.MethodPost && pathName == "/api/dashboard/account/default":
 		handleDashboardAccountDefault(w, r)
 	case r.Method == http.MethodPost && pathName == "/api/dashboard/account/remove":

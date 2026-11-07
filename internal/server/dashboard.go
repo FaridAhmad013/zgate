@@ -7,11 +7,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apissaj/zcode-gateway/internal/accounts"
@@ -36,17 +38,23 @@ type trafficLogEntry struct {
 	Status    int    `json:"status"`
 	Duration  int64  `json:"duration_ms"`
 	EventTag  string `json:"event_tag,omitempty"`
+	Model     string `json:"model,omitempty"`
+	Account   string `json:"account,omitempty"`
+	InTokens  int    `json:"in_tokens,omitempty"`
+	OutTokens int    `json:"out_tokens,omitempty"`
 }
 
 var (
 	loginFlowsMu sync.Mutex
 	loginFlows   = map[string]*loginFlowEntry{}
 
-	trafficMu   sync.RWMutex
-	trafficLogs []trafficLogEntry
+	trafficMu    sync.RWMutex
+	trafficLogs  []trafficLogEntry
+	totalInTokens  uint64
+	totalOutTokens uint64
 )
 
-func recordTrafficLog(reqID, method, path string, status int, dur time.Duration, eventTag string) {
+func recordTrafficLog(reqID, method, path string, status int, dur time.Duration, eventTag, model, acct string, inTok, outTok int) {
 	trafficMu.Lock()
 	defer trafficMu.Unlock()
 	entry := trafficLogEntry{
@@ -57,10 +65,20 @@ func recordTrafficLog(reqID, method, path string, status int, dur time.Duration,
 		Status:    status,
 		Duration:  dur.Milliseconds(),
 		EventTag:  eventTag,
+		Model:     model,
+		Account:   acct,
+		InTokens:  inTok,
+		OutTokens: outTok,
 	}
 	trafficLogs = append(trafficLogs, entry)
-	if len(trafficLogs) > 40 {
-		trafficLogs = trafficLogs[len(trafficLogs)-40:]
+	if len(trafficLogs) > 50 {
+		trafficLogs = trafficLogs[len(trafficLogs)-50:]
+	}
+	if inTok > 0 {
+		atomic.AddUint64(&totalInTokens, uint64(inTok))
+	}
+	if outTok > 0 {
+		atomic.AddUint64(&totalOutTokens, uint64(outTok))
 	}
 }
 
@@ -437,12 +455,14 @@ func handleDashboardStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sendJSON(w, http.StatusOK, map[string]any{
-		"ok":          true,
-		"auth":        authMode,
-		"bridgeToken": token,
-		"laneWidth":   laneWidth,
-		"accounts":    quotaViews,
-		"logs":        logsCopy,
+		"ok":             true,
+		"auth":           authMode,
+		"bridgeToken":    token,
+		"laneWidth":      laneWidth,
+		"accounts":       quotaViews,
+		"logs":           logsCopy,
+		"totalInTokens":  atomic.LoadUint64(&totalInTokens),
+		"totalOutTokens": atomic.LoadUint64(&totalOutTokens),
 	})
 }
 
@@ -553,6 +573,104 @@ func handleDashboardAccountDefault(w http.ResponseWriter, r *http.Request) {
 	if id != "" {
 		accounts.SetDefault(id)
 	}
+	sendJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func handleDashboardLoginCallback(w http.ResponseWriter, r *http.Request) {
+	if !isDashboardAuthorized(r) {
+		sendJSON(w, http.StatusUnauthorized, map[string]any{"ok": false, "error": "Authentication required"})
+		return
+	}
+
+	var req struct {
+		CallbackURL string `json:"callbackUrl"`
+		Label       string `json:"label"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		sendJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid payload"})
+		return
+	}
+
+	raw := strings.TrimSpace(req.CallbackURL)
+	if raw == "" {
+		sendJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "callbackUrl is required"})
+		return
+	}
+
+	// Extract state from full URL or standalone query string
+	parsedState := ""
+	if strings.Contains(raw, "state=") {
+		if parsed, err := url.Parse(raw); err == nil {
+			parsedState = parsed.Query().Get("state")
+		}
+		if parsedState == "" {
+			parts := strings.Split(raw, "state=")
+			if len(parts) > 1 {
+				sub := parts[1]
+				if idx := strings.IndexAny(sub, "&# "); idx != -1 {
+					parsedState = sub[:idx]
+				} else {
+					parsedState = sub
+				}
+			}
+		}
+	} else {
+		parsedState = raw
+	}
+	parsedState = strings.TrimSpace(parsedState)
+
+	if parsedState == "" {
+		sendJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "could not extract state/flowId from URL"})
+		return
+	}
+
+	// Find the flow that matches this state
+	loginFlowsMu.Lock()
+	var matchedFlow *loginFlowEntry
+	for _, entry := range loginFlows {
+		if entry.flow != nil && (entry.flow.FlowID == parsedState || strings.Contains(entry.flow.AuthorizeURL, parsedState)) {
+			matchedFlow = entry
+			break
+		}
+	}
+	loginFlowsMu.Unlock()
+
+	var flowToPoll *auth.DeviceFlow
+	if matchedFlow != nil {
+		flowToPoll = matchedFlow.flow
+	} else {
+		// Construct direct flow with parsedState as flowID
+		flowToPoll = &auth.DeviceFlow{
+			FlowID:    parsedState,
+			PollToken: parsedState,
+		}
+	}
+
+	pollCtx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+
+	result, ready, err := auth.PollOnce(pollCtx, flowToPoll)
+	if err != nil {
+		sendJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "Approval verification failed: " + err.Error()})
+		return
+	}
+	if !ready || result == nil {
+		sendJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "Z.ai server reports login is still pending or not approved yet"})
+		return
+	}
+
+	lbl := strings.TrimSpace(req.Label)
+	if lbl == "" {
+		lbl = "Manual Linked " + strconv.FormatInt(time.Now().Unix()%1000, 10)
+	}
+
+	expiresAt, _ := auth.ExpiryUnixMilli(result.JWT)
+	_, upsertErr := accounts.UpsertAccount("", lbl, result.JWT, result.RefreshToken, result.AccessToken, expiresAt)
+	if upsertErr != nil {
+		sendJSON(w, http.StatusOK, map[string]any{"ok": false, "error": upsertErr.Error()})
+		return
+	}
+
 	sendJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 

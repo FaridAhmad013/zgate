@@ -922,6 +922,11 @@
                     <div class="metric-sub">Token-Bucket Active</div>
                   </div>
                   <div class="metric-cell">
+                    <div class="metric-label">Session Tokens Used</div>
+                    <div class="metric-value" style="color:var(--orange); font-size:14px;" id="dashTotalTokens">0 Tok</div>
+                    <div class="metric-sub" id="dashTokensSub">0 in / 0 out</div>
+                  </div>
+                  <div class="metric-cell">
                     <div class="metric-label">Global Lane Width</div>
                     <div class="metric-value" id="dashLaneWidth">1</div>
                     <div class="metric-sub">Parallel Concurrency</div>
@@ -1037,7 +1042,13 @@
 
       <div id="loginStep2" style="display:none; text-align:center; margin-top:14px;">
         <a id="loginAuthUrl" href="#" target="_blank" class="btn" style="width:100%; justify-content:center; margin-bottom:10px; text-decoration:none;">Open Z.ai Approval Page</a>
-        <p id="pollStatusText" style="font-size:11px; font-family:var(--font-mono); color:var(--led-amber);">Waiting for browser authorization...</p>
+        <p id="pollStatusText" style="font-size:11px; font-family:var(--font-mono); color:var(--led-amber); margin-bottom:12px;">Waiting for browser authorization...</p>
+        
+        <div style="border-top:1px dashed #2f332f; padding-top:12px; margin-top:12px; text-align:left;">
+          <label style="display:block; font-size:10px; font-family:var(--font-mono); color:var(--text-dim); margin-bottom:4px;">INSTANT MANUAL CALLBACK VERIFICATION</label>
+          <input type="text" id="manualCallbackUrl" class="input" placeholder="Paste redirected callback URL or state here..." style="font-size:11px; margin-bottom:8px;">
+          <button class="btn btn-secondary" style="width:100%; justify-content:center; font-size:11px;" onclick="submitManualCallback()">Verify Instantly via URL</button>
+        </div>
       </div>
 
       <div style="margin-top:16px; text-align:right;">
@@ -1142,6 +1153,11 @@
         document.getElementById('routeBaseUrl').textContent = base;
         document.getElementById('dashLaneWidth').textContent = data.laneWidth || '1';
         document.getElementById('dashAcctCount').textContent = (data.accounts || []).length;
+        const inTok = data.totalInTokens || 0;
+        const outTok = data.totalOutTokens || 0;
+        const totalTok = inTok + outTok;
+        document.getElementById('dashTotalTokens').textContent = totalTok.toLocaleString() + ' Tok';
+        document.getElementById('dashTokensSub').textContent = inTok.toLocaleString() + ' in / ' + outTok.toLocaleString() + ' out';
         document.getElementById('headerNodeInfo').textContent = window.location.host;
         document.getElementById('daemonHostText').textContent = window.location.host;
 
@@ -1278,11 +1294,13 @@
         else if (l.status >= 500) statusClass = 'log-status-500';
 
         const tag = l.event_tag ? ` [${escapeHtml(l.event_tag)}]` : '';
+        const model = l.model ? ` [${escapeHtml(l.model)}]` : '';
+        const tokens = (l.in_tokens || l.out_tokens) ? ` (${l.in_tokens || 0} in / ${l.out_tokens || 0} out)` : '';
         return `
           <div class="log-line">
             <span class="log-time">[${l.timestamp}]</span>
             <span class="log-method">${escapeHtml(l.method)}</span>
-            <span class="log-path">${escapeHtml(l.path)}${tag}</span>
+            <span class="log-path">${escapeHtml(l.path)}${model}${tag}${tokens}</span>
             <span class="${statusClass}">[${l.status}]</span>
             <span class="log-dur">${l.duration_ms}ms</span>
           </div>
@@ -1361,7 +1379,32 @@
       }
     }
 
-    function copy9RouterConfig() {
+    async function submitManualCallback() {
+      const callbackUrl = document.getElementById('manualCallbackUrl').value.trim();
+      const label = document.getElementById('loginLabel').value.trim();
+      if (!callbackUrl) {
+        showToast('PASTE CALLBACK URL FIRST');
+        return;
+      }
+      try {
+        const res = await fetch('/api/dashboard/login/callback', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ callbackUrl, label })
+        });
+        const data = await res.json();
+        if (data.ok) {
+          if (pollInterval) clearInterval(pollInterval);
+          closeLoginModal();
+          showToast('ACCOUNT LINKED SUCCESSFULLY');
+          loadDashboard();
+        } else {
+          showToast('ERROR: ' + (data.error || 'Verification failed'));
+        }
+      } catch (err) {
+        showToast('COMMUNICATION ERROR');
+      }
+    }
       const config = {
         name: "ZGate",
         type: "Chat Completions",
