@@ -14,6 +14,7 @@ import (
 
 	"github.com/apissaj/zcode-gateway/internal/accounts"
 	"github.com/apissaj/zcode-gateway/internal/auth"
+	"github.com/apissaj/zcode-gateway/internal/quota"
 )
 
 //go:embed ui/dashboard.html
@@ -137,6 +138,21 @@ func handleDashboardAuthLogout(w http.ResponseWriter, r *http.Request) {
 	sendJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+type accountQuotaView struct {
+	ID            string  `json:"id"`
+	Label         string  `json:"label"`
+	Default       bool    `json:"default"`
+	HasRefresh    bool    `json:"hasRefresh"`
+	ExpiresAt     int64   `json:"expiresAt"`
+	Expired       bool    `json:"expired"`
+	NeedsReauth   bool    `json:"needsReauth"`
+	CooldownUntil string  `json:"cooldownUntil"`
+	TotalUnits    float64 `json:"totalUnits"`
+	UsedUnits     float64 `json:"usedUnits"`
+	RemainUnits   float64 `json:"remainUnits"`
+	UsagePercent  int     `json:"usagePercent"`
+}
+
 func handleDashboardStatus(w http.ResponseWriter, r *http.Request) {
 	if !isDashboardAuthorized(r) {
 		sendJSON(w, http.StatusUnauthorized, map[string]any{"ok": false, "error": "Authentication required"})
@@ -163,12 +179,60 @@ func handleDashboardStatus(w http.ResponseWriter, r *http.Request) {
 	copy(logsCopy, trafficLogs)
 	trafficMu.RUnlock()
 
+	// Read Quota for each active account
+	rawList := accounts.List()
+	quotaViews := make([]accountQuotaView, 0, len(ring))
+	for _, a := range ring {
+		view := accountQuotaView{
+			ID:            a.ID,
+			Label:         a.Label,
+			Default:       a.Default,
+			HasRefresh:    a.HasRefresh,
+			ExpiresAt:     a.ExpiresAt,
+			Expired:       a.Expired,
+			NeedsReauth:   a.NeedsReauth,
+			CooldownUntil: a.CooldownUntil,
+		}
+		// Find matching full account to read quota
+		for _, raw := range rawList {
+			if raw.ID == a.ID && raw.JWT != "" {
+				q, err := quota.ReadQuota(r.Context(), raw.JWT, raw.DeviceID)
+				if err == nil && len(q.Rows) > 0 {
+					var total, used, remain float64
+					for _, row := range q.Rows {
+						if u, ok := row.TotalUnits.(float64); ok && u > total {
+							total = u
+						}
+						if u, ok := row.UsedUnits.(float64); ok {
+							used += u
+						}
+						if u, ok := row.RemainingUnits.(float64); ok && u > remain {
+							remain = u
+						}
+					}
+					view.TotalUnits = total
+					view.UsedUnits = used
+					view.RemainUnits = remain
+					if total > 0 {
+						pct := int((used / total) * 100)
+						if pct > 100 {
+							pct = 100
+						}
+						view.UsagePercent = pct
+					}
+				}
+				break
+			}
+		}
+		quotaViews = append(quotaViews, view)
+	}
+
 	sendJSON(w, http.StatusOK, map[string]any{
 		"ok":          true,
 		"auth":        authMode,
 		"bridgeToken": c.BridgeToken,
 		"laneWidth":   laneWidth,
-		"accounts":    ring,
+		"accounts":    quotaViews,
 		"logs":        logsCopy,
 	})
 }
@@ -186,7 +250,11 @@ func handleDashboardLoginStart(w http.ResponseWriter, r *http.Request) {
 
 	flow, err := auth.StartDeviceFlow(r.Context())
 	if err != nil {
-		sendJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
+		errMsg := err.Error()
+		if errMsg == "" {
+			errMsg = fmt.Sprintf("%v", err)
+		}
+		sendJSON(w, http.StatusOK, map[string]any{"ok": false, "error": errMsg})
 		return
 	}
 
@@ -234,11 +302,15 @@ func handleDashboardLoginPoll(w http.ResponseWriter, r *http.Request) {
 
 	result, err := auth.PollDeviceFlow(pollCtx, entry.flow)
 	if err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "context deadline") || strings.Contains(strings.ToLower(err.Error()), "waiting") {
+		errMsg := err.Error()
+		if errMsg == "" {
+			errMsg = fmt.Sprintf("%v", err)
+		}
+		if strings.Contains(strings.ToLower(errMsg), "context deadline") || strings.Contains(strings.ToLower(errMsg), "waiting") {
 			sendJSON(w, http.StatusOK, map[string]any{"status": "pending"})
 			return
 		}
-		sendJSON(w, http.StatusOK, map[string]any{"status": "failed", "error": err.Error()})
+		sendJSON(w, http.StatusOK, map[string]any{"status": "failed", "error": errMsg})
 		return
 	}
 

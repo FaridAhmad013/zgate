@@ -6,93 +6,102 @@
   <title>ZGate Dashboard</title>
   <style>
     :root {
-      --bg-base: #090d16;
+      --bg-base: #070b14;
       --bg-surface: #0f172a;
       --bg-surface-elevated: #1e293b;
-      --border-subtle: #1e293b;
-      --border-strong: #334155;
-      --text-main: #f8fafc;
+      --border-card: #334155;
+      --text-primary: #f1f5f9;
       --text-muted: #94a3b8;
-      --primary: #3b82f6;
-      --primary-hover: #2563eb;
+      --accent-primary: #38bdf8;
+      --accent-hover: #0ea5e9;
+      --accent-glow: rgba(56, 189, 248, 0.25);
       --success: #10b981;
       --warning: #f59e0b;
       --danger: #ef4444;
       --code-bg: #030712;
-      --sidebar-width: 240px;
+      --card-radius: 14px;
+      --sidebar-width: 230px;
     }
-    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, sans-serif; }
-    body { background-color: var(--bg-base); color: var(--text-main); height: 100vh; overflow: hidden; display: flex; }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { background-color: var(--bg-base); color: var(--text-primary); height: 100vh; overflow: hidden; display: flex; -webkit-font-smoothing: antialiased; }
     
     /* Layout */
-    .app-sidebar { width: var(--sidebar-width); background: var(--bg-surface); border-right: 1px solid var(--border-subtle); display: flex; flex-direction: column; flex-shrink: 0; }
+    .app-sidebar { width: var(--sidebar-width); background: var(--bg-surface); border-right: 1px solid var(--border-card); display: flex; flex-direction: column; flex-shrink: 0; }
     .app-content { flex: 1; display: flex; flex-direction: column; overflow: hidden; background: var(--bg-base); }
-    .app-topbar { height: 60px; border-bottom: 1px solid var(--border-subtle); background: var(--bg-surface); display: flex; align-items: center; justify-content: space-between; padding: 0 24px; }
+    .app-topbar { height: 60px; border-bottom: 1px solid var(--border-card); background: rgba(15, 23, 42, 0.95); display: flex; align-items: center; justify-content: space-between; padding: 0 24px; backdrop-filter: blur(8px); }
     .main-scroll { flex: 1; overflow-y: auto; padding: 24px; }
 
-    /* Typography & Icons */
+    /* Brand & Icons */
     .icon { width: 16px; height: 16px; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; fill: none; display: inline-block; vertical-align: middle; }
-    .brand { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 15px; color: #fff; padding: 20px 18px; border-bottom: 1px solid var(--border-subtle); }
-    .badge { font-size: 11px; padding: 2px 8px; border-radius: 9999px; background: rgba(59,130,246,0.15); color: #60a5fa; border: 1px solid rgba(59,130,246,0.3); font-weight: 500; }
-    .badge-success { background: rgba(16,185,129,0.15); color: #34d399; border-color: rgba(16,185,129,0.3); }
-    .badge-neutral { background: rgba(148,163,184,0.1); color: #94a3b8; border: 1px solid rgba(148,163,184,0.2); }
-    .badge-default { background: rgba(59,130,246,0.15); color: #60a5fa; border: 1px solid rgba(59,130,246,0.3); font-size: 10px; padding: 1px 6px; }
+    .brand { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 15px; color: #fff; padding: 18px; border-bottom: 1px solid var(--border-card); }
+    .brand-logo { width: 28px; height: 28px; border-radius: 8px; background: linear-gradient(135deg, #0ea5e9 0%, #38bdf8 100%); display: flex; align-items: center; justify-content: center; color: #fff; box-shadow: 0 0 14px var(--accent-glow); }
+    
+    /* Badges */
+    .badge { font-size: 11px; padding: 2px 8px; border-radius: 9999px; background: rgba(56, 189, 248, 0.12); color: var(--accent-primary); border: 1px solid rgba(56, 189, 248, 0.3); font-weight: 500; display: inline-flex; align-items: center; gap: 5px; }
+    .badge-success { background: rgba(16, 185, 129, 0.12); color: #34d399; border-color: rgba(16, 185, 129, 0.3); }
+    .badge-neutral { background: rgba(148, 163, 184, 0.1); color: #94a3b8; border: 1px solid rgba(148, 163, 184, 0.2); }
+    .badge-default { background: rgba(56, 189, 248, 0.15); color: var(--accent-primary); border: 1px solid rgba(56, 189, 248, 0.3); font-size: 10px; padding: 1px 6px; }
 
     /* Nav Links */
-    .nav-list { list-style: none; padding: 12px 10px; flex: 1; }
-    .nav-item { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 6px; color: var(--text-muted); text-decoration: none; font-size: 13px; font-weight: 500; cursor: pointer; transition: all 0.15s ease; margin-bottom: 4px; }
+    .nav-list { list-style: none; padding: 14px 10px; flex: 1; }
+    .nav-item { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 8px; color: var(--text-muted); text-decoration: none; font-size: 13px; font-weight: 500; cursor: pointer; transition: all 0.2s ease; margin-bottom: 4px; }
     .nav-item:hover, .nav-item.active { background: var(--bg-surface-elevated); color: #fff; }
-    .nav-item.active { border-left: 3px solid var(--primary); }
+    .nav-item.active { border-left: 3px solid var(--accent-primary); border-radius: 0 8px 8px 0; }
 
-    /* Daemon Control in Sidebar */
-    .sidebar-footer { padding: 16px; border-top: 1px solid var(--border-subtle); }
-    .daemon-card { background: var(--code-bg); border: 1px solid var(--border-subtle); border-radius: 8px; padding: 12px; }
-    .daemon-status { display: flex; align-items: center; justify-content: space-between; font-size: 12px; margin-bottom: 8px; }
-    .dot-online { width: 8px; height: 8px; border-radius: 50%; background: var(--success); display: inline-block; box-shadow: 0 0 8px var(--success); }
+    /* Daemon Card in Sidebar */
+    .sidebar-footer { padding: 16px; border-top: 1px solid var(--border-card); }
+    .daemon-card { background: rgba(30, 41, 59, 0.5); border: 1px solid var(--border-card); border-radius: 10px; padding: 12px; }
+    .daemon-status { display: flex; align-items: center; justify-content: space-between; font-size: 12px; margin-bottom: 6px; }
+    .dot-online { width: 8px; height: 8px; border-radius: 50%; background: var(--success); display: inline-block; box-shadow: 0 0 10px var(--success); }
 
-    /* Cards & Grids */
+    /* Bento Cards (Portfolio Theme) */
     .grid { display: grid; grid-template-columns: 1fr; gap: 20px; }
     @media (min-width: 900px) { .grid-2 { grid-template-columns: 1fr 1fr; } }
-    .card { background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: 8px; padding: 20px; }
+    .card { background: var(--bg-surface); border: 1px solid var(--border-card); border-radius: var(--card-radius); padding: 20px; box-shadow: 0 4px 12px -2px rgba(0, 0, 0, 0.25); transition: border-color 0.2s ease; }
+    .card:hover { border-color: rgba(56, 189, 248, 0.4); }
     .card-title { font-size: 14px; font-weight: 600; color: #fff; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; }
 
-    /* Buttons & Inputs */
-    .btn { background: var(--primary); color: #fff; border: none; border-radius: 6px; padding: 8px 14px; font-size: 13px; font-weight: 500; cursor: pointer; display: inline-flex; align-items: center; gap: 8px; transition: all 0.15s ease; }
-    .btn:hover { background: var(--primary-hover); }
-    .btn-secondary { background: var(--bg-surface-elevated); border: 1px solid var(--border-strong); color: var(--text-main); }
-    .btn-secondary:hover { background: #334155; }
-    .btn-ghost-danger { background: rgba(239,68,68,0.05); color: #f87171; border: 1px solid rgba(239,68,68,0.25); border-radius: 4px; cursor: pointer; transition: all 0.15s ease; }
-    .btn-ghost-danger:hover { background: rgba(239,68,68,0.15); border-color: rgba(239,68,68,0.4); color: #ef4444; }
-    .input { background: var(--code-bg); border: 1px solid var(--border-strong); border-radius: 6px; padding: 8px 12px; color: #fff; width: 100%; font-size: 13px; outline: none; margin-bottom: 12px; }
-    .input:focus { border-color: var(--primary); }
+    /* Buttons & Interactive */
+    .btn { background: var(--accent-primary); color: #070b14; border: none; border-radius: 8px; padding: 8px 14px; font-size: 13px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 8px; transition: all 0.2s ease; }
+    .btn:hover { background: var(--accent-hover); box-shadow: 0 0 14px var(--accent-glow); }
+    .btn-secondary { background: var(--bg-surface-elevated); border: 1px solid var(--border-card); color: var(--text-primary); font-weight: 500; }
+    .btn-secondary:hover { background: #334155; border-color: #475569; }
+    .btn-ghost-danger { background: rgba(239, 68, 68, 0.06); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.25); border-radius: 6px; cursor: pointer; padding: 4px 8px; font-size: 11px; transition: all 0.2s ease; }
+    .btn-ghost-danger:hover { background: rgba(239, 68, 68, 0.16); border-color: rgba(239, 68, 68, 0.45); color: #ef4444; }
+    .input { background: var(--code-bg); border: 1px solid var(--border-card); border-radius: 8px; padding: 9px 12px; color: #fff; width: 100%; font-size: 13px; outline: none; margin-bottom: 12px; }
+    .input:focus { border-color: var(--accent-primary); box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.15); }
 
-    /* Config Display */
-    .config-code { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; color: #93c5fd; background: var(--code-bg); padding: 7px 12px; border-radius: 6px; border: 1px solid var(--border-subtle); display: flex; align-items: center; justify-content: space-between; }
-    .token-input-wrap { display: flex; align-items: center; background: var(--code-bg); border: 1px solid var(--border-subtle); border-radius: 6px; padding: 2px 8px; }
-    .token-field { flex: 1; border: none; background: transparent; color: #93c5fd; font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; outline: none; padding: 5px 4px; }
+    /* Config & Inputs */
+    .config-code { font-family: "JetBrains Mono", monospace; font-size: 12px; color: #bae6fd; background: var(--code-bg); padding: 7px 12px; border-radius: 6px; border: 1px solid var(--border-card); }
+    .token-input-wrap { display: flex; align-items: center; background: var(--code-bg); border: 1px solid var(--border-card); border-radius: 6px; padding: 2px 8px; }
+    .token-field { flex: 1; border: none; background: transparent; color: #bae6fd; font-family: "JetBrains Mono", monospace; font-size: 12px; outline: none; padding: 6px 4px; }
     .icon-btn { background: transparent; border: none; color: var(--text-muted); cursor: pointer; padding: 4px; display: inline-flex; align-items: center; border-radius: 4px; }
-    .icon-btn:hover { color: #fff; background: rgba(255,255,255,0.05); }
+    .icon-btn:hover { color: #fff; background: rgba(255, 255, 255, 0.08); }
 
     /* Table */
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    th { text-align: left; padding: 10px 12px; color: var(--text-muted); border-bottom: 1px solid var(--border-subtle); font-weight: 500; }
-    td { padding: 12px; border-bottom: 1px solid var(--border-subtle); vertical-align: middle; }
+    th { text-align: left; padding: 10px 12px; color: var(--text-muted); border-bottom: 1px solid var(--border-card); font-weight: 500; }
+    td { padding: 12px; border-bottom: 1px solid var(--border-card); vertical-align: middle; }
+
+    /* Quota Progress Bar */
+    .progress-track { width: 100%; max-width: 140px; height: 6px; background: rgba(51, 65, 85, 0.6); border-radius: 9999px; overflow: hidden; margin-top: 4px; }
+    .progress-fill { height: 100%; background: linear-gradient(90deg, #38bdf8 0%, #0ea5e9 100%); border-radius: 9999px; transition: width 0.3s ease; }
 
     /* Console Logs */
-    .console-box { background: var(--code-bg); border: 1px solid var(--border-subtle); border-radius: 6px; font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; padding: 12px; max-height: 140px; overflow-y: auto; color: #94a3b8; line-height: 1.8; }
+    .console-box { background: var(--code-bg); border: 1px solid var(--border-card); border-radius: 8px; font-family: "JetBrains Mono", monospace; font-size: 12px; padding: 12px; max-height: 140px; overflow-y: auto; color: #94a3b8; line-height: 1.8; }
     .log-line { display: flex; gap: 12px; }
     .log-time { color: #64748b; flex-shrink: 0; }
     .log-status-200 { color: #34d399; }
     .log-status-400 { color: #fbbf24; }
     .log-status-500 { color: #f87171; }
 
-    /* Modal */
-    .modal-backdrop { display: none; background: rgba(0,0,0,0.75); backdrop-filter: blur(4px); position: fixed; inset: 0; align-items: center; justify-content: center; z-index: 100; }
+    /* Modal Backdrop & Box */
+    .modal-backdrop { display: none; background: rgba(7, 11, 20, 0.85); backdrop-filter: blur(6px); position: fixed; inset: 0; align-items: center; justify-content: center; z-index: 100; }
     .modal-backdrop.active { display: flex; }
-    .modal { background: var(--bg-surface); border: 1px solid var(--border-strong); border-radius: 10px; width: 100%; max-width: 440px; padding: 24px; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.5); }
+    .modal { background: var(--bg-surface); border: 1px solid var(--border-card); border-radius: var(--card-radius); width: 100%; max-width: 440px; padding: 24px; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.6); }
 
     /* Toast */
-    .toast { position: fixed; bottom: 24px; right: 24px; background: var(--primary); color: #fff; padding: 10px 18px; border-radius: 6px; font-size: 13px; display: none; z-index: 200; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.3); }
+    .toast { position: fixed; bottom: 24px; right: 24px; background: #0284c7; color: #fff; padding: 10px 18px; border-radius: 8px; font-size: 13px; font-weight: 500; display: none; z-index: 200; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.4); }
 
     /* Tab views */
     .tab-view { display: none; }
@@ -103,9 +112,13 @@
   <!-- Sidebar -->
   <aside class="app-sidebar">
     <div class="brand">
-      <svg class="icon" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg>
-      <span>ZGate</span>
-      <span class="badge">v0.1.0</span>
+      <div class="brand-logo">
+        <svg class="icon" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg>
+      </div>
+      <div>
+        <div style="font-weight:700; font-size:14px; letter-spacing:-0.02em;">ZGate</div>
+        <div style="font-size:11px; color:var(--text-muted);">AI Gateway Proxy</div>
+      </div>
     </div>
 
     <ul class="nav-list">
@@ -115,7 +128,7 @@
       </li>
       <li class="nav-item" onclick="switchTab('accounts', this)">
         <svg class="icon" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M23 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></svg>
-        <span>Accounts</span>
+        <span>Accounts Pool</span>
       </li>
       <li class="nav-item" onclick="switchTab('routing', this)">
         <svg class="icon" viewBox="0 0 24 24"><circle cx="18" cy="5" r="3"></circle><circle cx="6" cy="12" r="3"></circle><circle cx="18" cy="19" r="3"></circle><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"></line><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"></line></svg>
@@ -127,7 +140,7 @@
       <div class="daemon-card">
         <div class="daemon-status">
           <span style="color:var(--text-muted);">Daemon Node</span>
-          <span><span class="dot-online"></span> <strong id="daemonStatusText">ONLINE</strong></span>
+          <span><span class="dot-online"></span> <strong id="daemonStatusText" style="color:#34d399;">ONLINE</strong></span>
         </div>
         <div style="font-size:11px; color:var(--text-muted); line-height:1.6;" id="daemonHostText">127.0.0.1:20131</div>
       </div>
@@ -145,11 +158,11 @@
       <!-- Center Status / Metric Indicators -->
       <div style="display:flex; align-items:center; gap:10px;">
         <span class="badge badge-neutral">
-          <svg class="icon" style="width:12px; height:12px; margin-right:4px;" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
+          <svg class="icon" style="width:12px; height:12px;" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
           Latency: ~12ms
         </span>
         <span class="badge badge-success">
-          <svg class="icon" style="width:12px; height:12px; margin-right:4px;" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg>
+          <svg class="icon" style="width:12px; height:12px;" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg>
           GLM-5.3 Ready
         </span>
       </div>
@@ -206,17 +219,17 @@
               Node Performance & Metrics
             </h3>
             <div style="font-size:13px; line-height:2.2;">
-              <div style="display:flex; justify-content:space-between; border-bottom:1px solid var(--border-subtle)">
+              <div style="display:flex; justify-content:space-between; border-bottom:1px solid var(--border-card)">
                 <span style="color:var(--text-muted)">Scheduler Mode</span>
                 <span>Least-InFlight Round-Robin</span>
               </div>
-              <div style="display:flex; justify-content:space-between; border-bottom:1px solid var(--border-subtle)">
+              <div style="display:flex; justify-content:space-between; border-bottom:1px solid var(--border-card)">
                 <span style="color:var(--text-muted)">Global Lane Width</span>
-                <strong id="dashLaneWidth">1</strong>
+                <strong id="dashLaneWidth" style="color:var(--accent-primary)">1</strong>
               </div>
-              <div style="display:flex; justify-content:space-between; border-bottom:1px solid var(--border-subtle)">
+              <div style="display:flex; justify-content:space-between; border-bottom:1px solid var(--border-card)">
                 <span style="color:var(--text-muted)">Active Account Pool</span>
-                <strong id="dashAcctCount">0</strong>
+                <strong id="dashAcctCount" style="color:var(--accent-primary)">0</strong>
               </div>
               <div style="display:flex; justify-content:space-between;">
                 <span style="color:var(--text-muted)">Rate Limiter</span>
@@ -226,18 +239,18 @@
           </div>
         </div>
 
-        <!-- Accounts Summary -->
+        <!-- Accounts Summary with Quota & Usage -->
         <div class="card" style="margin-bottom:20px;">
           <h3 class="card-title">
             <svg class="icon" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
-            Active Credential Pool
+            Active Credential Pool & Quota Balance
           </h3>
           <table>
             <thead>
               <tr>
                 <th>Status</th>
                 <th>Account Label</th>
-                <th>Token Expiry</th>
+                <th>Token Balance (Quota)</th>
                 <th>Cooldown</th>
                 <th>Actions</th>
               </tr>
@@ -269,7 +282,7 @@
           <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
             <h3 class="card-title" style="margin:0;">
               <svg class="icon" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle></svg>
-              Stored Z.ai Accounts
+              Stored Z.ai Accounts & Balances
             </h3>
             <button class="btn" onclick="startLoginModal()">+ Add New Account</button>
           </div>
@@ -278,7 +291,7 @@
               <tr>
                 <th>Status</th>
                 <th>Identifier / Label</th>
-                <th>Refreshable</th>
+                <th>Token Quota Remaining</th>
                 <th>Cooldown Timer</th>
                 <th>Actions</th>
               </tr>
@@ -439,6 +452,13 @@
       showToast('API Key copied to clipboard!');
     }
 
+    function formatNumber(num) {
+      if (!num || num <= 0) return '0';
+      if (num >= 1000000) return (num / 1000000).toFixed(1) + 'M';
+      if (num >= 1000) return (num / 1000).toFixed(1) + 'K';
+      return Math.round(num).toString();
+    }
+
     function renderAccounts(accounts) {
       const rows = accounts.map(a => {
         let stateBadge = '<span class="badge badge-success">Ready</span>';
@@ -446,15 +466,29 @@
         else if (a.expired) stateBadge = '<span class="badge" style="background:rgba(245,158,11,0.15); color:#fbbf24; border:1px solid rgba(245,158,11,0.3)">Expired</span>';
         else if (a.cooldownUntil) stateBadge = '<span class="badge" style="background:rgba(245,158,11,0.15); color:#fbbf24; border:1px solid rgba(245,158,11,0.3)">Cooling Down</span>';
 
+        const total = a.totalUnits || 0;
+        const remain = a.remainUnits || 0;
+        const pct = a.usagePercent || 0;
+        const quotaDisplay = total > 0 ? `
+          <div>
+            <div style="font-size:12px; color:#e2e8f0; font-family:'JetBrains Mono',monospace;">
+              <strong>${formatNumber(remain)}</strong> / ${formatNumber(total)} <span style="font-size:10px; color:var(--text-muted)">(${100 - pct}% left)</span>
+            </div>
+            <div class="progress-track">
+              <div class="progress-fill" style="width: ${Math.max(4, 100 - pct)}%"></div>
+            </div>
+          </div>
+        ` : `<span style="color:var(--text-muted); font-size:12px;">Active (Unlimited / Start Plan)</span>`;
+
         return `
           <tr>
             <td>${stateBadge}</td>
             <td><strong>${escapeHtml(a.label || a.id)}</strong> ${a.default ? '<span class="badge badge-default" style="margin-left:6px;">Default</span>' : ''}</td>
-            <td>${a.hasRefresh ? 'Available' : 'None'}</td>
+            <td>${quotaDisplay}</td>
             <td>${a.cooldownUntil ? escapeHtml(a.cooldownUntil) : '-'}</td>
             <td>
               ${!a.default ? `<button class="btn btn-secondary" style="padding:2px 8px; font-size:11px;" onclick="setDefaultAccount('${a.id}')">Set Default</button>` : ''}
-              <button class="btn-ghost-danger" style="padding:3px 8px; font-size:11px; margin-left:4px;" onclick="removeAccount('${a.id}')">Delete</button>
+              <button class="btn-ghost-danger" style="margin-left:4px;" onclick="removeAccount('${a.id}')">Delete</button>
             </td>
           </tr>
         `;
@@ -519,36 +553,45 @@
 
     async function requestLoginCode() {
       const label = document.getElementById('loginLabel').value.trim();
-      const res = await fetch('/api/dashboard/login/start', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ label })
-      });
-      const data = await res.json();
-      if (!data.ok) {
-        alert('Failed to start login: ' + (data.error || 'unknown'));
-        return;
-      }
-      document.getElementById('loginStep1').style.display = 'none';
-      document.getElementById('loginStep2').style.display = 'block';
-      const authLink = document.getElementById('loginAuthUrl');
-      authLink.href = data.authUrl;
-
-      if (pollInterval) clearInterval(pollInterval);
-      pollInterval = setInterval(async () => {
-        const pollRes = await fetch('/api/dashboard/login/poll?flowId=' + encodeURIComponent(data.flowId) + '&label=' + encodeURIComponent(label));
-        const pollData = await pollRes.json();
-        if (pollData.status === 'success') {
-          clearInterval(pollInterval);
-          closeLoginModal();
-          showToast('Account added successfully!');
-          loadDashboard();
-        } else if (pollData.status === 'failed') {
-          clearInterval(pollInterval);
-          alert('Login failed: ' + pollData.error);
-          closeLoginModal();
+      try {
+        const res = await fetch('/api/dashboard/login/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ label })
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          const errDetail = typeof data.error === 'object' ? JSON.stringify(data.error) : (data.error || 'Server error');
+          alert('Failed to start login: ' + errDetail);
+          return;
         }
-      }, 2500);
+        document.getElementById('loginStep1').style.display = 'none';
+        document.getElementById('loginStep2').style.display = 'block';
+        const authLink = document.getElementById('loginAuthUrl');
+        authLink.href = data.authUrl;
+
+        if (pollInterval) clearInterval(pollInterval);
+        pollInterval = setInterval(async () => {
+          try {
+            const pollRes = await fetch('/api/dashboard/login/poll?flowId=' + encodeURIComponent(data.flowId) + '&label=' + encodeURIComponent(label));
+            const pollData = await pollRes.json();
+            if (pollData.status === 'success') {
+              clearInterval(pollInterval);
+              closeLoginModal();
+              showToast('Account added successfully!');
+              loadDashboard();
+            } else if (pollData.status === 'failed') {
+              clearInterval(pollInterval);
+              alert('Login failed: ' + (typeof pollData.error === 'object' ? JSON.stringify(pollData.error) : pollData.error));
+              closeLoginModal();
+            }
+          } catch (e) {
+            console.error('Polling error:', e);
+          }
+        }, 2500);
+      } catch (networkErr) {
+        alert('Network error communicating with gateway: ' + networkErr.message);
+      }
     }
 
     function copy9RouterConfig() {
