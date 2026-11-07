@@ -51,7 +51,7 @@ func main() {
 		return
 	}
 	if len(args) > 0 && (args[0] == "-v" || args[0] == "--version" || args[0] == "version") {
-		fmt.Printf("zcode-gateway %s\n", version)
+		fmt.Printf("zgate %s\n", version)
 		return
 	}
 	serve()
