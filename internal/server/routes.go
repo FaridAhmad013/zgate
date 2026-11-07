@@ -585,11 +585,19 @@ func validHostHeader(r *http.Request, c Config) bool {
 }
 
 func isAllowedOrigin(origin, rawAllowlist string) bool {
-	if origin == "" || rawAllowlist == "" {
+	if origin == "" {
 		return false
 	}
 	parsedOrigin, err := url.Parse(origin)
 	if err != nil || (parsedOrigin.Scheme != "http" && parsedOrigin.Scheme != "https") || parsedOrigin.Host == "" {
+		return false
+	}
+	// Always allow same-host origin (dashboard UI calling its own backend API)
+	origHost := extractRequestHost(parsedOrigin.Host)
+	if IsLoopbackHost(origHost) {
+		return true
+	}
+	if rawAllowlist == "" {
 		return false
 	}
 	for _, entry := range strings.Split(rawAllowlist, ",") {
