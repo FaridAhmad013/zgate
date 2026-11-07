@@ -121,12 +121,16 @@ func msgSuffix(msg string) string {
 }
 
 // isTransient reports gateway responses worth retrying in place: model
-// concurrency, 429, 5xx. Account-wide failures are switchable instead.
+// concurrency (3009), account concurrency (3008) when no alternate account is
+// available, generic 429 (excluding 1113 quota exhaustion), and 5xx.
 func isTransient(err *UpstreamError) bool {
 	if err == nil {
 		return false
 	}
-	if codeIs(err.Code, 3009) {
+	if codeIs(err.Code, 1113) {
+		return false
+	}
+	if codeIs(err.Code, 3009) || codeIs(err.Code, 3008) {
 		return true
 	}
 	if err.Status == http.StatusTooManyRequests || err.Status >= 500 {
@@ -136,9 +140,9 @@ func isTransient(err *UpstreamError) bool {
 }
 
 // isSwitchable reports errors that justify rotating to the next account:
-// this credential's allowance is spent, it is rejected, or its user slot is
-// parked by the desktop client. Anything else (model concurrency 3009, 5xx,
-// transport) is global-ish and gets retried in place instead.
+// this credential's allowance is spent (1113), it is rejected (401/403), or
+// its user slot is busy on the desktop client (3008). Global model concurrency
+// (3009) and 5xx get retried in place instead.
 func isSwitchable(err *UpstreamError, status int) bool {
 	if err == nil {
 		return false
@@ -153,6 +157,15 @@ func isSwitchable(err *UpstreamError, status int) bool {
 		return true
 	}
 	return false
+}
+
+func concurrencyCooldown() time.Duration {
+	if v := strings.TrimSpace(osGetenv("ZCODE_CONCURRENCY_COOLDOWN_MS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Millisecond
+		}
+	}
+	return 5 * time.Second
 }
 
 func codeIs(code any, want float64) bool {
@@ -336,28 +349,38 @@ func SendAnthropic(o SendOpts) (*http.Response, error) {
 	}
 	client := o.HTTP
 	if client == nil {
-		client = &http.Client{Timeout: timeout}
+		client = &http.Client{
+			Timeout: timeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
 	}
 
 	var lastErr *UpstreamError
 	tried := map[string]bool{}
 	for attempt := 0; ; attempt++ {
 		var acct *candidate
+		remaining := 0
 		for i := range cands {
 			key := cands[i].ID
 			if key == "" {
 				key = fmt.Sprintf("legacy#%d", i)
 			}
 			if !tried[key] {
-				acct = &cands[i]
-				tried[key] = true
-				break
+				if acct == nil {
+					acct = &cands[i]
+					tried[key] = true
+				} else {
+					remaining++
+				}
 			}
 		}
 		if acct == nil {
 			break
 		}
-		res, err := runAccount(ctx, client, *acct, o, timeout)
+		hasMoreAccounts := remaining > 0
+		res, err := runAccount(ctx, client, *acct, o, timeout, hasMoreAccounts)
 		if err == nil {
 			if acct.ID != "" {
 				accounts.ClearCooldown(acct.ID)
@@ -374,9 +397,17 @@ func SendAnthropic(o SendOpts) (*http.Response, error) {
 		}
 		if acct.ID != "" {
 			switch {
-			case ue.Status == 401 || ue.Status == 403:
+			case ue.Status == http.StatusUnauthorized || ue.Status == http.StatusForbidden:
 				accounts.MarkReauth(acct.ID)
-			case ue.Code == float64(1113) || ue.Status == http.StatusTooManyRequests:
+			case codeIs(ue.Code, 3008):
+				// 3008 is transient account concurrency (desktop app active), not
+				// quota exhaustion. Never lock out a single-account setup; when
+				// multiple accounts exist, apply only a brief cooldown so the next
+				// request prefers an idle account.
+				if len(cands) > 1 {
+					accounts.MarkCooldown(acct.ID, concurrencyCooldown())
+				}
+			case codeIs(ue.Code, 1113) || (ue.Status == http.StatusTooManyRequests && !codeIs(ue.Code, 3009)):
 				accounts.MarkCooldown(acct.ID, 0)
 			default:
 				accounts.MarkCooldown(acct.ID, 2*time.Minute)
@@ -391,8 +422,8 @@ func SendAnthropic(o SendOpts) (*http.Response, error) {
 }
 
 // runAccount runs one account's turn: transient retries in place, one
-// refresh on 401, then a switchable error => throw for rotation.
-func runAccount(ctx context.Context, client *http.Client, acct candidate, o SendOpts, timeout time.Duration) (*http.Response, error) {
+// singleflight refresh on 401, then a switchable error => throw for rotation.
+func runAccount(ctx context.Context, client *http.Client, acct candidate, o SendOpts, timeout time.Duration, hasMoreAccounts bool) (*http.Response, error) {
 	maxAttempts := 3
 	if v := osGetenv("ZCODE_MAX_ATTEMPTS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -431,33 +462,21 @@ func runAccount(ctx context.Context, client *http.Client, acct candidate, o Send
 				lastErr.AccountSwitch = true
 			}
 		}
-		// 401 handling: a stored account gets one best-effort refresh; the
-		// legacy token re-reads its sources (the desktop app may have
-		// rotated the JWT underneath us). Either way the retry does not
-		// consume the transient budget. Runs before the switch return so
-		// a revoked-then-refreshed account recovers in place.
+		// 401 handling: a stored account gets one singleflight refresh (shared
+		// across concurrent requests for the same account); the legacy token
+		// re-reads its sources (the desktop app may have rotated the JWT
+		// underneath us). Either way the retry does not consume the transient
+		// budget. Runs before the switch return so a revoked-then-refreshed
+		// account recovers in place.
 		if lastErr.Status == http.StatusUnauthorized && !refreshed {
 			refreshed = true
 			handled := false
 			switch {
 			case acct.ID != "":
-				for _, a := range accounts.List() {
-					if a.ID == acct.ID {
-						if fresh, err := auth.RefreshPlanJWT(ctx, a.RefreshToken); err == nil {
-							claims, _ := auth.DecodeJWT(fresh.JWT)
-							var exp int64
-							if claims != nil {
-								if e, ok := claims["exp"].(float64); ok {
-									exp = int64(e) * 1000
-								}
-							}
-							accounts.Upsert(acct.ID, acct.Label, fresh.JWT, fresh.RefreshToken, fresh.AccessToken, exp)
-							bearer = fresh.JWT
-							handled = true
-							n--
-						}
-						break
-					}
+				if freshJWT, _, err := accounts.RefreshAccountSingleflight(ctx, acct.ID, bearer); err == nil && freshJWT != "" {
+					bearer = freshJWT
+					handled = true
+					n--
 				}
 			case o.JWT == "":
 				if fresh := auth.ResolvePlanJWT(""); fresh != "" && fresh != bearer {
@@ -470,7 +489,10 @@ func runAccount(ctx context.Context, client *http.Client, acct candidate, o Send
 				continue
 			}
 		}
-		if lastErr.AccountSwitch {
+		// For 3008 (account concurrency), switch immediately if another healthy
+		// account is waiting in the ring; otherwise stay and use the bounded
+		// in-place retry budget before giving up.
+		if lastErr.AccountSwitch && (!codeIs(lastErr.Code, 3008) || hasMoreAccounts) {
 			return nil, lastErr
 		}
 		if !isTransient(lastErr) || n >= maxAttempts-1 {
@@ -515,6 +537,11 @@ func attemptOnce(ctx context.Context, client *http.Client, acct candidate, beare
 		return nil, &UpstreamError{Msg: "marshal body: " + err.Error(), Status: 500, Kind: "config"}
 	}
 
+	baseOrigin, err := auth.ValidateOriginURL(InferenceOrigin)
+	if err != nil {
+		return nil, &UpstreamError{Msg: "invalid inference origin: " + err.Error(), Status: 500, Kind: "config"}
+	}
+
 	// The lane is a process-wide queue, so one hung upstream socket would
 	// stall every later request behind it. Race a hard deadline against the
 	// caller's context (AbortSignal.any equivalent).
@@ -522,7 +549,7 @@ func attemptOnce(ctx context.Context, client *http.Client, acct candidate, beare
 	// NO deferred cancel: the response body keeps streaming after this
 	// function returns, and canceling here would kill it mid-flight. The
 	// returned body is wrapped so cancel runs when the consumer closes it.
-	req, err := http.NewRequestWithContext(callCtx, http.MethodPost, InferenceOrigin+PlanAnthropicPath, bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(callCtx, http.MethodPost, baseOrigin+PlanAnthropicPath, bytes.NewReader(raw))
 	if err != nil {
 		cancel()
 		return nil, &UpstreamError{Msg: "build request: " + err.Error(), Status: 500, Kind: "config"}

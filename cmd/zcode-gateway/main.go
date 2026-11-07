@@ -126,18 +126,19 @@ func deviceLogin(label string) {
 		os.Exit(1)
 	}
 	claims, _ := auth.DecodeJWT(result.JWT)
-	var expiresAt int64
-	if e, ok := claims["exp"].(float64); ok {
-		expiresAt = int64(e) * 1000
-	} else {
-		expiresAt = time.Now().Add(24 * time.Hour).UnixMilli()
-	}
+	expiresAt, _ := auth.ExpiryUnixMilli(result.JWT)
 	userID, _ := claims["user_id"].(string)
 	if userID == "" {
 		userID, _ = claims["sub"].(string)
 	}
-	// Upsert derives the stable account id from the JWT's user_id.
-	tmp := accounts.Upsert("", label, result.JWT, result.RefreshToken, result.AccessToken, expiresAt)
+	// UpsertAccount derives the stable account id from the JWT's user_id.
+	// Plan JWTs without an `exp` claim keep expiresAt == 0 (revocation is
+	// detected via upstream 401 responses, never via a synthetic 24h timer).
+	tmp, err := accounts.UpsertAccount("", label, result.JWT, result.RefreshToken, result.AccessToken, expiresAt)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "login failed: could not persist account: %s\n", auth.Redact(err.Error()))
+		os.Exit(1)
+	}
 	fmt.Printf("\nAuthorized. account %s (user %s) stored in %s\n",
 		tmp.ID, orUnknown(userID), accounts.AccountsFile())
 	if result.RefreshToken != "" {
