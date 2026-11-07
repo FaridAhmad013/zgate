@@ -1,0 +1,537 @@
+package server
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/apissaj/zcode-gateway/internal/accounts"
+	"github.com/apissaj/zcode-gateway/internal/auth"
+	"github.com/apissaj/zcode-gateway/internal/models"
+	"github.com/apissaj/zcode-gateway/internal/transport"
+)
+
+func setupBenchEnv(b testing.TB) func() {
+	b.Helper()
+	dir := b.TempDir()
+	prevFile := os.Getenv("ZCODE_ACCOUNTS_FILE")
+	prevMid := os.Getenv("ZCODE_IDENTITY_DEVICE_MID")
+	prevRate := os.Getenv("ZCODE_RATE_LIMIT_RPS")
+	prevLane := os.Getenv("ZCODE_LANE_WIDTH")
+	prevLog := os.Getenv("ZCODE_ACCESS_LOG")
+
+	_ = os.Setenv("ZCODE_ACCOUNTS_FILE", filepath.Join(dir, "accounts.json"))
+	_ = os.Setenv("ZCODE_IDENTITY_DEVICE_MID", "bench-device-mid-0001")
+	_ = os.Setenv("ZCODE_RATE_LIMIT_RPS", "0")
+	_ = os.Setenv("ZCODE_LANE_WIDTH", "128")
+	_ = os.Setenv("ZCODE_ACCESS_LOG", "0")
+
+	jwt1 := fakeJWT("bench_u1")
+	jwt2 := fakeJWT("bench_u2")
+	_, _ = accounts.UpsertAccount("b1", "Bench-1", jwt1, "rt_bench_1", "at_1", time.Now().Add(24*time.Hour).UnixMilli())
+	_, _ = accounts.UpsertAccount("b2", "Bench-2", jwt2, "rt_bench_2", "at_2", time.Now().Add(24*time.Hour).UnixMilli())
+
+	Configure(Config{Port: 0, Host: "127.0.0.1", BridgeToken: "", ModelsCache: 5 * time.Minute})
+
+	return func() {
+		_ = os.Setenv("ZCODE_ACCOUNTS_FILE", prevFile)
+		_ = os.Setenv("ZCODE_IDENTITY_DEVICE_MID", prevMid)
+		_ = os.Setenv("ZCODE_RATE_LIMIT_RPS", prevRate)
+		_ = os.Setenv("ZCODE_LANE_WIDTH", prevLane)
+		_ = os.Setenv("ZCODE_ACCESS_LOG", prevLog)
+	}
+}
+
+// --- Section 2: Internal Component Benchmarks (testing.B) ---
+
+func BenchmarkSSEReader(b *testing.B) {
+	payload := strings.Repeat(
+		"event: content_block_delta\r\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello world chunk\"}}\r\n\r\n",
+		20,
+	) + "event: message_stop\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n"
+	raw := []byte(payload)
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(raw)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		r := transport.NewSSEReader(bytes.NewReader(raw), 0)
+		for {
+			_, err := r.Next()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+}
+
+func BenchmarkValidateRequest(b *testing.B) {
+	reqBody := map[string]any{
+		"model":            "glm-5.3-flash:high",
+		"max_tokens":       float64(4096),
+		"reasoning_effort": "high",
+		"messages": []any{
+			map[string]any{"role": "system", "content": "You are a helpful coding assistant."},
+			map[string]any{"role": "user", "content": "Write a concurrent worker pool in Go."},
+		},
+		"tools": []any{
+			map[string]any{
+				"type": "function",
+				"function": map[string]any{
+					"name":       "run_test",
+					"parameters": map[string]any{"type": "object"},
+				},
+			},
+		},
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := models.ValidateRequest(reqBody, "openai"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkSessionKeyFor(b *testing.B) {
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	body := map[string]any{
+		"model": "glm-5.3-flash",
+		"messages": []any{
+			map[string]any{"role": "system", "content": "System prompt instructions here."},
+			map[string]any{"role": "user", "content": "First user message in conversation."},
+			map[string]any{"role": "assistant", "content": "Assistant response."},
+			map[string]any{"role": "user", "content": "Follow-up question."},
+		},
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if k := SessionKeyFor(req, body); k == "" {
+			b.Fatal("empty key")
+		}
+	}
+}
+
+func BenchmarkRateLimiter(b *testing.B) {
+	cleanup := setupBenchEnv(b)
+	defer cleanup()
+	_ = os.Setenv("ZCODE_RATE_LIMIT_RPS", "1000000")
+	_ = os.Setenv("ZCODE_RATE_LIMIT_BURST", "1000000")
+	resetRateLimiter()
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.RemoteAddr = "127.0.0.1:54321"
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ok, _ := allowRequest(req)
+		if !ok {
+			b.Fatal("rate limited unexpectedly")
+		}
+	}
+}
+
+func BenchmarkAccountSelection(b *testing.B) {
+	cleanup := setupBenchEnv(b)
+	defer cleanup()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cands, err := transport.Candidates("", "")
+		if err != nil || len(cands) == 0 {
+			b.Fatalf("Candidates failed: %v", err)
+		}
+	}
+}
+
+func BenchmarkTokenRefreshCoordination(b *testing.B) {
+	cleanup := setupBenchEnv(b)
+	defer cleanup()
+
+	accts := accounts.List()
+	target := accts[0]
+	currentJWT := target.JWT
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			// Pass a synthetic staleJWT that differs from currentJWT so the fast
+			// singleflight coordination check sees the token is already fresh.
+			_, _, err := accounts.RefreshAccountSingleflight(context.Background(), target.ID, "stale-jwt-value")
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	_ = currentJWT
+}
+
+func BenchmarkErrorRedaction(b *testing.B) {
+	sample := `upstream failed: Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoidTEifQ.sig and {"refreshToken":"rt_secret_999"}`
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		out := auth.RedactSecrets(sample, "my-bridge-secret-token")
+		if strings.Contains(out, "rt_secret_999") {
+			b.Fatal("unredacted")
+		}
+	}
+}
+
+func BenchmarkJSONRequestParsingAndShaping(b *testing.B) {
+	raw := []byte(`{
+		"model":"glm-5.3-flash:high",
+		"messages":[
+			{"role":"system","content":"Be concise."},
+			{"role":"user","content":"Explain quicksort."}
+		],
+		"max_tokens":1024
+	}`)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		body, ok := parseJSON(raw)
+		if !ok {
+			b.Fatal("parseJSON failed")
+		}
+		anth := models.OpenAIToAnthropic(body)
+		shaped, err := transport.ShapePlanBody(anth, "session_0123456789abcdef0123456789abcdef", "dev-1", "user-1")
+		if err != nil || shaped == nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// --- Section 1: End-to-End Gateway Benchmarks (Mock Upstream) ---
+
+func newMockUpstreamServer() *httptest.Server {
+	nonStreamResp := []byte(`{"id":"msg_bench","type":"message","role":"assistant","model":"glm-5.3-flash","content":[{"type":"thinking","thinking":"step 1"},{"type":"text","text":"Hello from benchmark"}],"stop_reason":"end_turn","usage":{"input_tokens":16,"output_tokens":12}}`)
+	toolResp := []byte(`{"id":"msg_tool","type":"message","role":"assistant","model":"glm-5.3-flash","content":[{"type":"tool_use","id":"call_1","name":"get_weather","input":{"city":"Jakarta"}}],"stop_reason":"tool_use","usage":{"input_tokens":20,"output_tokens":15}}`)
+	streamPayload := []byte(
+		"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_s1\",\"model\":\"glm-5.3-flash\"}}\n\n" +
+			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"think...\"}}\n\n" +
+			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello \"}}\n\n" +
+			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"world!\"}}\n\n" +
+			"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":10,\"output_tokens\":8}}\n\n" +
+			"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+	)
+
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		if bytes.Contains(raw, []byte(`"stream":true`)) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(streamPayload)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if bytes.Contains(raw, []byte(`"tools"`)) {
+			_, _ = w.Write(toolResp)
+			return
+		}
+		_, _ = w.Write(nonStreamResp)
+	}))
+}
+
+func runGatewayBenchmark(b *testing.B, path string, payload []byte) {
+	cleanup := setupBenchEnv(b)
+	defer cleanup()
+
+	upstream := newMockUpstreamServer()
+	defer upstream.Close()
+	origInf := transport.InferenceOrigin
+	transport.InferenceOrigin = upstream.URL
+	defer func() { transport.InferenceOrigin = origInf }()
+
+	handler := Route()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		req := httptest.NewRequest("POST", path, bytes.NewReader(payload))
+		req.Host = "127.0.0.1:20131"
+		req.RemoteAddr = "127.0.0.1:50000"
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Request-Id", "req_bench_fixed_01")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			b.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func BenchmarkGatewayOpenAINonStreaming(b *testing.B) {
+	runGatewayBenchmark(b, "/v1/chat/completions", []byte(`{"model":"glm-5.3-flash","messages":[{"role":"user","content":"Hello"}]}`))
+}
+
+func BenchmarkGatewayAnthropicNonStreaming(b *testing.B) {
+	runGatewayBenchmark(b, "/v1/messages", []byte(`{"model":"glm-5.3-flash","max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}`))
+}
+
+func BenchmarkGatewayOpenAIStreaming(b *testing.B) {
+	runGatewayBenchmark(b, "/v1/chat/completions", []byte(`{"model":"glm-5.3-flash","stream":true,"messages":[{"role":"user","content":"Hello"}]}`))
+}
+
+func BenchmarkGatewayAnthropicStreaming(b *testing.B) {
+	runGatewayBenchmark(b, "/v1/messages", []byte(`{"model":"glm-5.3-flash","stream":true,"max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}`))
+}
+
+func BenchmarkGatewayToolCalling(b *testing.B) {
+	runGatewayBenchmark(b, "/v1/chat/completions", []byte(`{"model":"glm-5.3-flash","messages":[{"role":"user","content":"Weather?"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}]}`))
+}
+
+func BenchmarkGatewayImagePayload(b *testing.B) {
+	imgData := "data:image/png;base64," + strings.Repeat("iVBORw0KGgoAAAANSUhEUgAAAAUA", 128)
+	payload := fmt.Sprintf(`{"model":"glm-5.3-flash","messages":[{"role":"user","content":[{"type":"text","text":"Describe"},{"type":"image_url","image_url":{"url":"%s"}}]}]}`, imgData)
+	runGatewayBenchmark(b, "/v1/chat/completions", []byte(payload))
+}
+
+// --- Section 1, 3, 4, 6: Reproducible Load, Streaming & Lane Width Harness ---
+
+type benchSummary struct {
+	Name       string
+	Reqs       int
+	Errors     int
+	RPS        float64
+	AvgMs      float64
+	P50Ms      float64
+	P95Ms      float64
+	P99Ms      float64
+	HeapKBDiff int64
+	Goroutines int
+}
+
+func percentile(sorted []time.Duration, p float64) float64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	idx := int(float64(len(sorted)-1) * p)
+	return float64(sorted[idx].Microseconds()) / 1000.0
+}
+
+func TestRunBaselineAndStressSuite(t *testing.T) {
+	if os.Getenv("ZCODE_RUN_BENCH_REPORT") != "1" {
+		t.Skip("skipping full load/stress benchmark report; set ZCODE_RUN_BENCH_REPORT=1 to execute")
+	}
+	cleanup := setupBenchEnv(t)
+	defer cleanup()
+
+	var activeUpstreamConns int32
+	var maxUpstreamConns int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cur := atomic.AddInt32(&activeUpstreamConns, 1)
+		for {
+			m := atomic.LoadInt32(&maxUpstreamConns)
+			if cur <= m || atomic.CompareAndSwapInt32(&maxUpstreamConns, m, cur) {
+				break
+			}
+		}
+		defer atomic.AddInt32(&activeUpstreamConns, -1)
+
+		raw, _ := io.ReadAll(r.Body)
+		_ = r.Body.Close()
+
+		if bytes.Contains(raw, []byte(`"stream":true`)) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			flusher, _ := w.(http.Flusher)
+			chunks := 6
+			chunkText := "token-chunk "
+			if bytes.Contains(raw, []byte(`"large-chunks"`)) {
+				chunkText = strings.Repeat("X", 4096)
+			}
+			_, _ = fmt.Fprintf(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_load\",\"model\":\"glm-5.3-flash\"}}\n\n")
+			if flusher != nil {
+				flusher.Flush()
+			}
+			for i := 0; i < chunks; i++ {
+				if bytes.Contains(raw, []byte(`"paced-stream"`)) {
+					time.Sleep(2 * time.Millisecond)
+				}
+				_, _ = fmt.Fprintf(w, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":%q}}\n\n", chunkText)
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
+			_, _ = fmt.Fprintf(w, "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":12,\"output_tokens\":18}}\n\n")
+			_, _ = fmt.Fprintf(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+			if flusher != nil {
+				flusher.Flush()
+			}
+			return
+		}
+
+		if bytes.Contains(raw, []byte(`"paced-work"`)) {
+			time.Sleep(5 * time.Millisecond)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","model":"glm-5.3-flash","content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`))
+	}))
+	defer upstream.Close()
+
+	origInf := transport.InferenceOrigin
+	transport.InferenceOrigin = upstream.URL
+	defer func() { transport.InferenceOrigin = origInf }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	errCh := make(chan error, 1)
+	go func() { errCh <- Serve(ctx, ln) }()
+	baseURL := "http://" + ln.Addr().String()
+	defer func() {
+		cancel()
+		<-errCh
+	}()
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			MaxIdleConns:        256,
+			MaxIdleConnsPerHost: 256,
+			IdleConnTimeout:     60 * time.Second,
+		},
+	}
+
+	runScenario := func(name, path, body string, totalReqs, concurrency, laneWidth int) benchSummary {
+		_ = os.Setenv("ZCODE_LANE_WIDTH", fmt.Sprint(laneWidth))
+		runtime.GC()
+		var memBefore runtime.MemStats
+		runtime.ReadMemStats(&memBefore)
+
+		latencies := make([]time.Duration, totalReqs)
+		var errCount int32
+		var idx int32
+
+		start := time.Now()
+		var wg sync.WaitGroup
+		for w := 0; w < concurrency; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					i := int(atomic.AddInt32(&idx, 1)) - 1
+					if i >= totalReqs {
+						return
+					}
+					t0 := time.Now()
+					req, _ := http.NewRequest("POST", baseURL+path, strings.NewReader(body))
+					req.Header.Set("Content-Type", "application/json")
+					req.Header.Set("X-Request-Id", "req_load_01")
+					resp, err := client.Do(req)
+					if err != nil {
+						atomic.AddInt32(&errCount, 1)
+						latencies[i] = time.Since(t0)
+						continue
+					}
+					_, _ = io.Copy(io.Discard, resp.Body)
+					resp.Body.Close()
+					if resp.StatusCode != http.StatusOK {
+						atomic.AddInt32(&errCount, 1)
+					}
+					latencies[i] = time.Since(t0)
+				}
+			}()
+		}
+		wg.Wait()
+		elapsed := time.Since(start)
+
+		var memAfter runtime.MemStats
+		runtime.ReadMemStats(&memAfter)
+
+		sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+		var sum time.Duration
+		for _, d := range latencies {
+			sum += d
+		}
+		avgMs := float64(sum.Microseconds()) / float64(len(latencies)) / 1000.0
+		s := benchSummary{
+			Name:       name,
+			Reqs:       totalReqs,
+			Errors:     int(errCount),
+			RPS:        float64(totalReqs) / elapsed.Seconds(),
+			AvgMs:      avgMs,
+			P50Ms:      percentile(latencies, 0.50),
+			P95Ms:      percentile(latencies, 0.95),
+			P99Ms:      percentile(latencies, 0.99),
+			HeapKBDiff: (int64(memAfter.HeapAlloc) - int64(memBefore.HeapAlloc)) / 1024,
+			Goroutines: runtime.NumGoroutine(),
+		}
+		t.Logf("SCENARIO %-36s | reqs=%4d err=%2d | RPS=%8.1f | avg=%6.2fms p50=%6.2fms p95=%6.2fms p99=%6.2fms | heapDiff=%+5dKB goroutines=%d",
+			s.Name, s.Reqs, s.Errors, s.RPS, s.AvgMs, s.P50Ms, s.P95Ms, s.P99Ms, s.HeapKBDiff, s.Goroutines)
+		return s
+	}
+
+	// 1. Core Scenarios (concurrency=10, laneWidth=64)
+	img64 := "data:image/png;base64," + strings.Repeat("iVBORw0KGgoAAAANSUhEUgAAAAUA", 128)
+	runScenario("OpenAI Non-Streaming", "/v1/chat/completions", `{"model":"glm-5.3-flash","messages":[{"role":"user","content":"Hello"}]}`, 400, 10, 64)
+	runScenario("Anthropic Non-Streaming", "/v1/messages", `{"model":"glm-5.3-flash","max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}`, 400, 10, 64)
+	runScenario("OpenAI Streaming (Small Chunks)", "/v1/chat/completions", `{"model":"glm-5.3-flash","stream":true,"messages":[{"role":"user","content":"Hello"}]}`, 400, 10, 64)
+	runScenario("OpenAI Streaming (4KB Chunks)", "/v1/chat/completions", `{"model":"glm-5.3-flash","stream":true,"messages":[{"role":"user","content":"large-chunks"}]}`, 400, 10, 64)
+	runScenario("Anthropic Streaming", "/v1/messages", `{"model":"glm-5.3-flash","stream":true,"max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}`, 400, 10, 64)
+	runScenario("Tool Calling (OpenAI)", "/v1/chat/completions", `{"model":"glm-5.3-flash","messages":[{"role":"user","content":"Weather?"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}]}`, 400, 10, 64)
+	runScenario("Image Payload (Base64)", "/v1/chat/completions", fmt.Sprintf(`{"model":"glm-5.3-flash","messages":[{"role":"user","content":[{"type":"text","text":"Describe"},{"type":"image_url","image_url":{"url":"%s"}}]}]}`, img64), 400, 10, 64)
+
+	// 2. Streaming TTFB & Inter-Chunk Latency Measurement
+	_ = os.Setenv("ZCODE_LANE_WIDTH", "16")
+	t0 := time.Now()
+	sreq, _ := http.NewRequest("POST", baseURL+"/v1/chat/completions", strings.NewReader(`{"model":"glm-5.3-flash","stream":true,"messages":[{"role":"user","content":"paced-stream"}]}`))
+	sreq.Header.Set("Content-Type", "application/json")
+	sresp, err := client.Do(sreq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ttfb := time.Since(t0)
+	scanner := bufio.NewScanner(sresp.Body)
+	lastChunkAt := time.Now()
+	var interChunk []time.Duration
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "data: ") {
+			now := time.Now()
+			interChunk = append(interChunk, now.Sub(lastChunkAt))
+			lastChunkAt = now
+		}
+	}
+	sresp.Body.Close()
+	sort.Slice(interChunk, func(i, j int) bool { return interChunk[i] < interChunk[j] })
+	t.Logf("STREAM TIMING | TTFB=%v | chunks=%d | p50_inter_chunk=%.2fms | p95_inter_chunk=%.2fms | total=%v",
+		ttfb, len(interChunk), percentile(interChunk, 0.50), percentile(interChunk, 0.95), time.Since(t0))
+
+	// 3. Lane Width Comparison (ZCODE_LANE_WIDTH = 1, 2, 4, 8 with 16 concurrent callers, 5ms upstream work)
+	for _, lw := range []int{1, 2, 4, 8} {
+		runScenario(fmt.Sprintf("LaneWidth=%d (16 conc, 5ms upstream)", lw), "/v1/chat/completions", `{"model":"glm-5.3-flash","messages":[{"role":"user","content":"paced-work"}]}`, 160, 16, lw)
+	}
+
+	// 4. Concurrency Scaling / Stress Test (5, 10, 25, 50, 100 concurrent callers)
+	for _, conc := range []int{5, 10, 25, 50, 100} {
+		runScenario(fmt.Sprintf("Stress Concurrency=%d (Mixed Stream)", conc), "/v1/chat/completions", `{"model":"glm-5.3-flash","stream":true,"messages":[{"role":"user","content":"Hello"}]}`, 500, conc, 64)
+	}
+	t.Logf("MAX UPSTREAM CONNS OBSERVED=%d | FINAL GOROUTINES=%d", atomic.LoadInt32(&maxUpstreamConns), runtime.NumGoroutine())
+}
