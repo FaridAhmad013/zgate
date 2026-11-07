@@ -21,6 +21,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"net"
+	"net/url"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -52,10 +55,66 @@ type AuthError struct {
 
 func (e *AuthError) Error() string { return Redact(e.Msg) }
 
+// ValidateOriginURL validates an OAuth or inference origin URL.
+// Remote origins must use https://; http:// is only allowed for loopback hosts
+// during local development or testing.
+func ValidateOriginURL(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", errors.New("origin URL must not be empty")
+	}
+	u, err := url.Parse(trimmed)
+	if err != nil {
+		return "", fmt.Errorf("invalid origin URL: %w", err)
+	}
+	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return "", errors.New("origin URL must not contain userinfo, query, or fragment")
+	}
+	if u.Path != "" && u.Path != "/" {
+		return "", errors.New("origin URL must not contain a path")
+	}
+	host := u.Hostname()
+	if host == "" {
+		return "", errors.New("origin URL missing host")
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		return "https://" + u.Host, nil
+	case "http":
+		if !IsLoopbackHostname(host) {
+			return "", fmt.Errorf("insecure http:// origin %q is only permitted for loopback hosts", u.Host)
+		}
+		return "http://" + u.Host, nil
+	default:
+		return "", fmt.Errorf("unsupported origin URL scheme %q", u.Scheme)
+	}
+}
+
+// IsLoopbackHostname reports whether host is localhost or a loopback IP.
+func IsLoopbackHostname(host string) bool {
+	h := strings.Trim(strings.TrimSpace(host), "[]")
+	if strings.EqualFold(h, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(h); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
 // DecodeJWT parses a JWT's payload claims without verifying the signature.
+// Both the header and payload segments must be valid base64url JSON objects.
 func DecodeJWT(token string) (map[string]any, bool) {
 	parts := strings.Split(strings.TrimSpace(token), ".")
-	if len(parts) != 3 {
+	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+		return nil, false
+	}
+	hdrRaw, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return nil, false
+	}
+	var hdr map[string]any
+	if err := json.Unmarshal(hdrRaw, &hdr); err != nil || len(hdr) == 0 {
 		return nil, false
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
@@ -63,24 +122,49 @@ func DecodeJWT(token string) (map[string]any, bool) {
 		return nil, false
 	}
 	var claims map[string]any
-	if err := json.Unmarshal(raw, &claims); err != nil {
+	if err := json.Unmarshal(raw, &claims); err != nil || len(claims) == 0 {
 		return nil, false
 	}
 	return claims, true
 }
 
-// IsExpired reports whether the token carries an exp that has passed
-// (plus skew). Tokens without exp — the plan JWT shape — are never "expired".
-func IsExpired(token string, now time.Time) bool {
+// ExpiryUnixMilli extracts a JWT's expiration timestamp in Unix milliseconds.
+//   - If the token is a valid JWT without an `exp` claim (the standard ZCode plan
+//     JWT shape), it returns (0, true) — callers must NOT invent a synthetic expiry.
+//   - If the token has a valid positive `exp` claim, it returns (expMs, true).
+//   - If the token is malformed or carries an invalid `exp` claim, it returns (0, false).
+func ExpiryUnixMilli(token string) (int64, bool) {
 	claims, ok := DecodeJWT(token)
 	if !ok {
-		return false
+		return 0, false
 	}
-	exp, ok := claims["exp"].(float64)
+	rawExp, hasExp := claims["exp"]
+	if !hasExp || rawExp == nil {
+		return 0, true
+	}
+	exp, ok := rawExp.(float64)
+	if !ok || math.IsNaN(exp) || math.IsInf(exp, 0) || exp <= 0 {
+		return 0, false
+	}
+	if exp > 1e12 {
+		return int64(exp), true
+	}
+	return int64(exp * 1000), true
+}
+
+// IsExpired reports whether the token is malformed, carries an invalid exp claim,
+// or carries an exp claim that has passed (plus ExpirySkew).
+// Valid tokens without an exp claim — the plan JWT shape — return false; their
+// revocation is detected via upstream 401 responses.
+func IsExpired(token string, now time.Time) bool {
+	expMs, ok := ExpiryUnixMilli(token)
 	if !ok {
+		return true
+	}
+	if expMs == 0 {
 		return false
 	}
-	return time.Unix(int64(exp), 0).Before(now.Add(ExpirySkew))
+	return time.UnixMilli(expMs).Before(now.Add(ExpirySkew))
 }
 
 // DeviceFlow is one started OAuth device flow.
@@ -95,12 +179,16 @@ type DeviceFlow struct {
 // StartDeviceFlow begins the CLI OAuth device flow. The caller shows
 // AuthorizeURL to the user; Poll resolves once they approve.
 func StartDeviceFlow(ctx context.Context) (*DeviceFlow, error) {
+	base, err := ValidateOriginURL(OAuthBase)
+	if err != nil {
+		return nil, &AuthError{Msg: "invalid oauth origin: " + err.Error(), Kind: "config"}
+	}
 	pollToken := make([]byte, 32)
 	if _, err := randRead(pollToken); err != nil {
 		return nil, &AuthError{Msg: "poll token entropy: " + err.Error(), Kind: "config"}
 	}
 	payload := strings.NewReader(`{"provider":"zai"}`)
-	req, err := newRequest(ctx, "POST", OAuthBase+"/api/v1/oauth/cli/init", payload,
+	req, err := newRequest(ctx, "POST", base+"/api/v1/oauth/cli/init", payload,
 		map[string]string{
 			"Authorization": "Bearer " + hexEncode(pollToken),
 			"Content-Type":  "application/json",
@@ -129,6 +217,12 @@ func StartDeviceFlow(ctx context.Context) (*DeviceFlow, error) {
 	}
 	if status < 200 || status >= 300 || out.Data.FlowID == "" || out.Data.AuthorizeURL == "" {
 		return nil, &AuthError{Msg: fmt.Sprintf("device flow init failed (HTTP %d) %s", status, Redact(out.Msg)), Status: status, Kind: "auth"}
+	}
+	if err := validateFlowID(out.Data.FlowID); err != nil {
+		return nil, &AuthError{Msg: "device flow init: " + err.Error(), Kind: "protocol"}
+	}
+	if err := validateAuthorizeURL(out.Data.AuthorizeURL); err != nil {
+		return nil, &AuthError{Msg: "device flow init: " + err.Error(), Kind: "protocol"}
 	}
 	exp := time.Now().Add(5 * time.Minute)
 	switch v := out.Data.ExpiresAt.(type) {
@@ -160,9 +254,45 @@ type FlowResult struct {
 	RefreshToken string
 }
 
+func validateFlowID(flowID string) error {
+	trimmed := strings.TrimSpace(flowID)
+	if trimmed == "" || trimmed == "." || trimmed == ".." || strings.ContainsAny(trimmed, "/\\?#%") || strings.Contains(trimmed, "..") {
+		return errors.New("invalid flow_id")
+	}
+	return nil
+}
+
+func validateAuthorizeURL(raw string) error {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" {
+		return errors.New("invalid authorize_url")
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		return nil
+	case "http":
+		if IsLoopbackHostname(u.Hostname()) {
+			return nil
+		}
+		return errors.New("insecure authorize_url scheme")
+	default:
+		return errors.New("unsupported authorize_url scheme")
+	}
+}
+
 // Poll polls the device flow until the user approves, it fails, or the flow
 // expires.
 func PollDeviceFlow(ctx context.Context, flow *DeviceFlow) (*FlowResult, error) {
+	if flow == nil {
+		return nil, &AuthError{Msg: "device flow is nil", Kind: "config"}
+	}
+	base, err := ValidateOriginURL(OAuthBase)
+	if err != nil {
+		return nil, &AuthError{Msg: "invalid oauth origin: " + err.Error(), Kind: "config"}
+	}
+	if err := validateFlowID(flow.FlowID); err != nil {
+		return nil, &AuthError{Msg: "build poll: " + err.Error(), Kind: "config"}
+	}
 	deadline := flow.ExpiresAt
 	if deadline.IsZero() {
 		deadline = time.Now().Add(5 * time.Minute)
@@ -171,6 +301,7 @@ func PollDeviceFlow(ctx context.Context, flow *DeviceFlow) (*FlowResult, error) 
 	if interval <= 0 {
 		interval = 2 * time.Second
 	}
+	pollURL := fmt.Sprintf("%s/api/v1/oauth/cli/poll/%s", base, url.PathEscape(strings.TrimSpace(flow.FlowID)))
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, &AuthError{Msg: "device flow polling aborted", Kind: "cancelled"}
@@ -178,8 +309,7 @@ func PollDeviceFlow(ctx context.Context, flow *DeviceFlow) (*FlowResult, error) 
 		if time.Now().After(deadline) {
 			return nil, &AuthError{Msg: "device flow expired before approval", Kind: "expired"}
 		}
-		req, err := newRequest(ctx, "GET",
-			fmt.Sprintf("%s/api/v1/oauth/cli/poll/%s", OAuthBase, flow.FlowID), nil,
+		req, err := newRequest(ctx, "GET", pollURL, nil,
 			map[string]string{"Authorization": "Bearer " + flow.PollToken})
 		if err != nil {
 			return nil, &AuthError{Msg: "build poll: " + err.Error(), Kind: "config"}
@@ -238,8 +368,12 @@ func RefreshPlanJWT(ctx context.Context, refreshToken string) (*FlowResult, erro
 	if strings.TrimSpace(refreshToken) == "" {
 		return nil, &AuthError{Msg: "no refresh token stored", Kind: "config"}
 	}
+	base, err := ValidateOriginURL(OAuthBase)
+	if err != nil {
+		return nil, &AuthError{Msg: "invalid oauth origin: " + err.Error(), Kind: "config"}
+	}
 	payload := strings.NewReader(fmt.Sprintf(`{"provider":"zai","grant_type":"refresh_token","refresh_token":%q}`, refreshToken))
-	req, err := newRequest(ctx, "POST", OAuthBase+"/api/v1/oauth/token", payload,
+	req, err := newRequest(ctx, "POST", base+"/api/v1/oauth/token", payload,
 		map[string]string{"Content-Type": "application/json", "Accept": "application/json"})
 	if err != nil {
 		return nil, &AuthError{Msg: "build refresh: " + err.Error(), Kind: "config"}
@@ -294,6 +428,9 @@ func ReadBridgeTokenFile() string {
 	file := os.Getenv("ZCODE_PLAN_JWT_FILE")
 	if file == "" {
 		file = "plan-jwt.json"
+	}
+	if info, err := os.Stat(file); err == nil && info.Mode().Perm() != 0o600 {
+		_ = os.Chmod(file, 0o600)
 	}
 	raw, err := os.ReadFile(file)
 	if err != nil {

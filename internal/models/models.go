@@ -13,6 +13,9 @@ package models
 
 import (
 	"encoding/json"
+	"errors"
+	"net"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -131,6 +134,7 @@ func ToAnthropicContent(content any) any {
 		case "image_url":
 			iu, _ := m["image_url"].(map[string]any)
 			u, _ := iu["url"].(string)
+			u = strings.TrimSpace(u)
 			if u == "" {
 				continue
 			}
@@ -139,10 +143,10 @@ func ToAnthropicContent(content any) any {
 					"type":   "image",
 					"source": map[string]any{"type": "base64", "media_type": mt, "data": data},
 				})
-			} else {
+			} else if cleanURL, err := ValidateImageURL(u); err == nil {
 				blocks = append(blocks, map[string]any{
 					"type":   "image",
-					"source": map[string]any{"type": "url", "url": u},
+					"source": map[string]any{"type": "url", "url": cleanURL},
 				})
 			}
 		}
@@ -153,14 +157,55 @@ func ToAnthropicContent(content any) any {
 	return blocks
 }
 
-var dataURLRe = regexp.MustCompile(`^data:([^;]+);base64,(.*)$`)
+var dataURLRe = regexp.MustCompile(`^data:([^;]+);base64,([A-Za-z0-9+/=\r\n]+)$`)
 
 func parseDataURL(u string) (mediaType, data string, ok bool) {
-	m := dataURLRe.FindStringSubmatch(u)
+	m := dataURLRe.FindStringSubmatch(strings.TrimSpace(u))
 	if m == nil {
 		return "", "", false
 	}
-	return m[1], m[2], true
+	mt := strings.ToLower(strings.TrimSpace(m[1]))
+	if !strings.HasPrefix(mt, "image/") {
+		return "", "", false
+	}
+	cleanData := strings.TrimSpace(m[2])
+	if cleanData == "" {
+		return "", "", false
+	}
+	return mt, cleanData, true
+}
+
+// ValidateImageURL validates a remote image_url before forwarding upstream.
+// Only https:// URLs targeting public hosts are allowed; loopback, RFC1918
+// private networks, link-local/cloud metadata IPs, and non-HTTPS schemes are rejected.
+func ValidateImageURL(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", errors.New("empty image URL")
+	}
+	u, err := url.Parse(trimmed)
+	if err != nil {
+		return "", err
+	}
+	if !strings.EqualFold(u.Scheme, "https") {
+		return "", errors.New("image_url must use https scheme")
+	}
+	if u.User != nil {
+		return "", errors.New("image_url must not contain userinfo")
+	}
+	host := strings.ToLower(strings.Trim(u.Hostname(), "[]"))
+	if host == "" {
+		return "", errors.New("image_url missing host")
+	}
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") || strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") {
+		return "", errors.New("image_url must not target local or internal hosts")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
+			return "", errors.New("image_url must not target private, loopback, or link-local IP addresses")
+		}
+	}
+	return u.String(), nil
 }
 
 // Block is a generic Anthropic content block (tool_result/tool_use/text).

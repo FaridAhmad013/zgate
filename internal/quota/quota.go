@@ -90,14 +90,23 @@ type envelope struct {
 }
 
 func fetchEnvelope(ctx context.Context, path string, headers map[string]string) envelope {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, identity.Origin()+path, nil)
+	baseOrigin, err := auth.ValidateOriginURL(identity.Origin())
+	if err != nil {
+		return envelope{Msg: wrap(err)}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseOrigin+path, nil)
 	if err != nil {
 		return envelope{Msg: wrap(err)}
 	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	client := &http.Client{Timeout: 20 * time.Second}
+	client := &http.Client{
+		Timeout: 20 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	res, err := client.Do(req)
 	if err != nil {
 		return envelope{Msg: wrap(err)}
