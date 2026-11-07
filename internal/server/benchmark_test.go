@@ -12,7 +12,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -312,16 +314,20 @@ func BenchmarkGatewayImagePayload(b *testing.B) {
 // --- Section 1, 3, 4, 6: Reproducible Load, Streaming & Lane Width Harness ---
 
 type benchSummary struct {
-	Name       string
-	Reqs       int
-	Errors     int
-	RPS        float64
-	AvgMs      float64
-	P50Ms      float64
-	P95Ms      float64
-	P99Ms      float64
-	HeapKBDiff int64
-	Goroutines int
+	Name        string
+	Reqs        int
+	Errors      int
+	RPS         float64
+	AvgMs       float64
+	P50Ms       float64
+	P95Ms       float64
+	P99Ms       float64
+	QueueP50Ms  float64
+	QueueP95Ms  float64
+	ProcP50Ms   float64
+	ProcP95Ms   float64
+	HeapAllocKB int64
+	Goroutines  int
 }
 
 func percentile(sorted []time.Duration, p float64) float64 {
@@ -330,6 +336,12 @@ func percentile(sorted []time.Duration, p float64) float64 {
 	}
 	idx := int(float64(len(sorted)-1) * p)
 	return float64(sorted[idx].Microseconds()) / 1000.0
+}
+
+func medianFloat(vals []float64) float64 {
+	cp := append([]float64(nil), vals...)
+	sort.Float64s(cp)
+	return cp[len(cp)/2]
 }
 
 func TestRunBaselineAndStressSuite(t *testing.T) {
@@ -342,6 +354,7 @@ func TestRunBaselineAndStressSuite(t *testing.T) {
 	var activeUpstreamConns int32
 	var maxUpstreamConns int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		enterNano := time.Now().UnixNano()
 		cur := atomic.AddInt32(&activeUpstreamConns, 1)
 		for {
 			m := atomic.LoadInt32(&maxUpstreamConns)
@@ -354,6 +367,7 @@ func TestRunBaselineAndStressSuite(t *testing.T) {
 		raw, _ := io.ReadAll(r.Body)
 		_ = r.Body.Close()
 
+		w.Header().Set("X-Upstream-Enter-Nano", strconv.FormatInt(enterNano, 10))
 		if bytes.Contains(raw, []byte(`"stream":true`)) {
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(http.StatusOK)
@@ -363,7 +377,7 @@ func TestRunBaselineAndStressSuite(t *testing.T) {
 			if bytes.Contains(raw, []byte(`"large-chunks"`)) {
 				chunkText = strings.Repeat("X", 4096)
 			}
-			_, _ = fmt.Fprintf(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_load\",\"model\":\"glm-5.3-flash\"}}\n\n")
+			_, _ = fmt.Fprintf(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_%d\",\"model\":\"glm-5.3-flash\"}}\n\n", enterNano)
 			if flusher != nil {
 				flusher.Flush()
 			}
@@ -389,7 +403,7 @@ func TestRunBaselineAndStressSuite(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","model":"glm-5.3-flash","content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`))
+		_, _ = fmt.Fprintf(w, `{"id":"msg_%d","type":"message","role":"assistant","model":"glm-5.3-flash","content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`, enterNano)
 	}))
 	defer upstream.Close()
 
@@ -419,13 +433,33 @@ func TestRunBaselineAndStressSuite(t *testing.T) {
 		},
 	}
 
-	runScenario := func(name, path, body string, totalReqs, concurrency, laneWidth int) benchSummary {
+	// Warm-up phase (60 requests across 10 workers) so TCP pools and caches are warm.
+	_ = os.Setenv("ZCODE_LANE_WIDTH", "64")
+	var warmWG sync.WaitGroup
+	for w := 0; w < 10; w++ {
+		warmWG.Add(1)
+		go func() {
+			defer warmWG.Done()
+			for i := 0; i < 6; i++ {
+				resp, err := client.Post(baseURL+"/v1/chat/completions", "application/json",
+					strings.NewReader(`{"model":"glm-5.3-flash","messages":[{"role":"user","content":"warmup"}]}`))
+				if err == nil {
+					_, _ = io.Copy(io.Discard, resp.Body)
+					resp.Body.Close()
+				}
+			}
+		}()
+	}
+	warmWG.Wait()
+	t.Logf("BENCH ENV | GOMAXPROCS=%d | NumCPU=%d | Warmup=60 reqs complete", runtime.GOMAXPROCS(0), runtime.NumCPU())
+
+	runOnce := func(name, path, body string, totalReqs, concurrency, laneWidth int) benchSummary {
 		_ = os.Setenv("ZCODE_LANE_WIDTH", fmt.Sprint(laneWidth))
 		runtime.GC()
-		var memBefore runtime.MemStats
-		runtime.ReadMemStats(&memBefore)
 
 		latencies := make([]time.Duration, totalReqs)
+		queueWaits := make([]time.Duration, totalReqs)
+		procTimes := make([]time.Duration, totalReqs)
 		var errCount int32
 		var idx int32
 
@@ -450,12 +484,33 @@ func TestRunBaselineAndStressSuite(t *testing.T) {
 						latencies[i] = time.Since(t0)
 						continue
 					}
-					_, _ = io.Copy(io.Discard, resp.Body)
+					rawResp, _ := io.ReadAll(resp.Body)
 					resp.Body.Close()
+					tDone := time.Now()
+					totalDur := tDone.Sub(t0)
+					latencies[i] = totalDur
+
+					// Extract upstream entry timestamp to split Queue Wait vs Active Processing time.
+					enterNs := extractEnterNano(rawResp)
+					if enterNs > 0 {
+						enterTime := time.Unix(0, enterNs)
+						qWait := enterTime.Sub(t0)
+						if qWait < 0 {
+							qWait = 0
+						}
+						pDur := tDone.Sub(enterTime)
+						if pDur < 0 {
+							pDur = 0
+						}
+						queueWaits[i] = qWait
+						procTimes[i] = pDur
+					} else {
+						procTimes[i] = totalDur
+					}
+
 					if resp.StatusCode != http.StatusOK {
 						atomic.AddInt32(&errCount, 1)
 					}
-					latencies[i] = time.Since(t0)
 				}
 			}()
 		}
@@ -466,37 +521,65 @@ func TestRunBaselineAndStressSuite(t *testing.T) {
 		runtime.ReadMemStats(&memAfter)
 
 		sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+		sort.Slice(queueWaits, func(i, j int) bool { return queueWaits[i] < queueWaits[j] })
+		sort.Slice(procTimes, func(i, j int) bool { return procTimes[i] < procTimes[j] })
 		var sum time.Duration
 		for _, d := range latencies {
 			sum += d
 		}
 		avgMs := float64(sum.Microseconds()) / float64(len(latencies)) / 1000.0
-		s := benchSummary{
-			Name:       name,
-			Reqs:       totalReqs,
-			Errors:     int(errCount),
-			RPS:        float64(totalReqs) / elapsed.Seconds(),
-			AvgMs:      avgMs,
-			P50Ms:      percentile(latencies, 0.50),
-			P95Ms:      percentile(latencies, 0.95),
-			P99Ms:      percentile(latencies, 0.99),
-			HeapKBDiff: (int64(memAfter.HeapAlloc) - int64(memBefore.HeapAlloc)) / 1024,
-			Goroutines: runtime.NumGoroutine(),
+		return benchSummary{
+			Name:        name,
+			Reqs:        totalReqs,
+			Errors:      int(errCount),
+			RPS:         float64(totalReqs) / elapsed.Seconds(),
+			AvgMs:       avgMs,
+			P50Ms:       percentile(latencies, 0.50),
+			P95Ms:       percentile(latencies, 0.95),
+			P99Ms:       percentile(latencies, 0.99),
+			QueueP50Ms:  percentile(queueWaits, 0.50),
+			QueueP95Ms:  percentile(queueWaits, 0.95),
+			ProcP50Ms:   percentile(procTimes, 0.50),
+			ProcP95Ms:   percentile(procTimes, 0.95),
+			HeapAllocKB: int64(memAfter.HeapAlloc) / 1024,
+			Goroutines:  runtime.NumGoroutine(),
 		}
-		t.Logf("SCENARIO %-36s | reqs=%4d err=%2d | RPS=%8.1f | avg=%6.2fms p50=%6.2fms p95=%6.2fms p99=%6.2fms | heapDiff=%+5dKB goroutines=%d",
-			s.Name, s.Reqs, s.Errors, s.RPS, s.AvgMs, s.P50Ms, s.P95Ms, s.P99Ms, s.HeapKBDiff, s.Goroutines)
-		return s
 	}
 
-	// 1. Core Scenarios (concurrency=10, laneWidth=64)
+	run3Median := func(name, path, body string, totalReqs, concurrency, laneWidth int) {
+		const runs = 3
+		var rps, avg, p50, p95, p99, qp50, qp95, pp50, pp95 []float64
+		var last benchSummary
+		for r := 1; r <= runs; r++ {
+			s := runOnce(name, path, body, totalReqs, concurrency, laneWidth)
+			last = s
+			rps = append(rps, s.RPS)
+			avg = append(avg, s.AvgMs)
+			p50 = append(p50, s.P50Ms)
+			p95 = append(p95, s.P95Ms)
+			p99 = append(p99, s.P99Ms)
+			qp50 = append(qp50, s.QueueP50Ms)
+			qp95 = append(qp95, s.QueueP95Ms)
+			pp50 = append(pp50, s.ProcP50Ms)
+			pp95 = append(pp95, s.ProcP95Ms)
+		}
+		t.Logf("MEDIAN(3) %-36s | RPS=%7.1f (runs: %.0f,%.0f,%.0f) | total p50=%5.2fms p95=%6.2fms p99=%6.2fms | queue p50=%5.2fms p95=%6.2fms | proc p50=%5.2fms p95=%5.2fms | heap=%4dKB gor=%d err=%d",
+			name, medianFloat(rps), rps[0], rps[1], rps[2],
+			medianFloat(p50), medianFloat(p95), medianFloat(p99),
+			medianFloat(qp50), medianFloat(qp95),
+			medianFloat(pp50), medianFloat(pp95),
+			last.HeapAllocKB, last.Goroutines, last.Errors)
+	}
+
+	// 1. Core Scenarios (3x repeated, concurrency=10, laneWidth=64, 300 reqs/run)
 	img64 := "data:image/png;base64," + strings.Repeat("iVBORw0KGgoAAAANSUhEUgAAAAUA", 128)
-	runScenario("OpenAI Non-Streaming", "/v1/chat/completions", `{"model":"glm-5.3-flash","messages":[{"role":"user","content":"Hello"}]}`, 400, 10, 64)
-	runScenario("Anthropic Non-Streaming", "/v1/messages", `{"model":"glm-5.3-flash","max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}`, 400, 10, 64)
-	runScenario("OpenAI Streaming (Small Chunks)", "/v1/chat/completions", `{"model":"glm-5.3-flash","stream":true,"messages":[{"role":"user","content":"Hello"}]}`, 400, 10, 64)
-	runScenario("OpenAI Streaming (4KB Chunks)", "/v1/chat/completions", `{"model":"glm-5.3-flash","stream":true,"messages":[{"role":"user","content":"large-chunks"}]}`, 400, 10, 64)
-	runScenario("Anthropic Streaming", "/v1/messages", `{"model":"glm-5.3-flash","stream":true,"max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}`, 400, 10, 64)
-	runScenario("Tool Calling (OpenAI)", "/v1/chat/completions", `{"model":"glm-5.3-flash","messages":[{"role":"user","content":"Weather?"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}]}`, 400, 10, 64)
-	runScenario("Image Payload (Base64)", "/v1/chat/completions", fmt.Sprintf(`{"model":"glm-5.3-flash","messages":[{"role":"user","content":[{"type":"text","text":"Describe"},{"type":"image_url","image_url":{"url":"%s"}}]}]}`, img64), 400, 10, 64)
+	run3Median("OpenAI Non-Streaming", "/v1/chat/completions", `{"model":"glm-5.3-flash","messages":[{"role":"user","content":"Hello"}]}`, 300, 10, 64)
+	run3Median("Anthropic Non-Streaming", "/v1/messages", `{"model":"glm-5.3-flash","max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}`, 300, 10, 64)
+	run3Median("OpenAI Streaming (Small Chunks)", "/v1/chat/completions", `{"model":"glm-5.3-flash","stream":true,"messages":[{"role":"user","content":"Hello"}]}`, 300, 10, 64)
+	run3Median("OpenAI Streaming (4KB Chunks)", "/v1/chat/completions", `{"model":"glm-5.3-flash","stream":true,"messages":[{"role":"user","content":"large-chunks"}]}`, 300, 10, 64)
+	run3Median("Anthropic Streaming", "/v1/messages", `{"model":"glm-5.3-flash","stream":true,"max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}`, 300, 10, 64)
+	run3Median("Tool Calling (OpenAI)", "/v1/chat/completions", `{"model":"glm-5.3-flash","messages":[{"role":"user","content":"Weather?"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}]}`, 300, 10, 64)
+	run3Median("Image Payload (Base64)", "/v1/chat/completions", fmt.Sprintf(`{"model":"glm-5.3-flash","messages":[{"role":"user","content":[{"type":"text","text":"Describe"},{"type":"image_url","image_url":{"url":"%s"}}]}]}`, img64), 300, 10, 64)
 
 	// 2. Streaming TTFB & Inter-Chunk Latency Measurement
 	_ = os.Setenv("ZCODE_LANE_WIDTH", "16")
@@ -524,14 +607,63 @@ func TestRunBaselineAndStressSuite(t *testing.T) {
 	t.Logf("STREAM TIMING | TTFB=%v | chunks=%d | p50_inter_chunk=%.2fms | p95_inter_chunk=%.2fms | total=%v",
 		ttfb, len(interChunk), percentile(interChunk, 0.50), percentile(interChunk, 0.95), time.Since(t0))
 
-	// 3. Lane Width Comparison (ZCODE_LANE_WIDTH = 1, 2, 4, 8 with 16 concurrent callers, 5ms upstream work)
+	// 3. Lane Width Comparison (3x repeated: ZCODE_LANE_WIDTH = 1, 2, 4, 8 with 16 concurrent callers, 5ms upstream work)
 	for _, lw := range []int{1, 2, 4, 8} {
-		runScenario(fmt.Sprintf("LaneWidth=%d (16 conc, 5ms upstream)", lw), "/v1/chat/completions", `{"model":"glm-5.3-flash","messages":[{"role":"user","content":"paced-work"}]}`, 160, 16, lw)
+		run3Median(fmt.Sprintf("LaneWidth=%d (16 conc, 5ms upstream)", lw), "/v1/chat/completions", `{"model":"glm-5.3-flash","messages":[{"role":"user","content":"paced-work"}]}`, 160, 16, lw)
 	}
 
-	// 4. Concurrency Scaling / Stress Test (5, 10, 25, 50, 100 concurrent callers)
+	// 4. Concurrency Scaling / Stress Test (3x repeated: 5, 10, 25, 50, 100 concurrent callers, laneWidth=128)
 	for _, conc := range []int{5, 10, 25, 50, 100} {
-		runScenario(fmt.Sprintf("Stress Concurrency=%d (Mixed Stream)", conc), "/v1/chat/completions", `{"model":"glm-5.3-flash","stream":true,"messages":[{"role":"user","content":"Hello"}]}`, 500, conc, 64)
+		run3Median(fmt.Sprintf("Stress Concurrency=%d (Stream)", conc), "/v1/chat/completions", `{"model":"glm-5.3-flash","stream":true,"messages":[{"role":"user","content":"Hello"}]}`, 400, conc, 128)
 	}
+
+	// 5. Resource-Constrained Go Runtime Simulation (GOMAXPROCS=1/512MB, GOMAXPROCS=1/1GB, GOMAXPROCS=2/2GB)
+	origProcs := runtime.GOMAXPROCS(0)
+	origMemLimit := debug.SetMemoryLimit(-1)
+	defer func() {
+		runtime.GOMAXPROCS(origProcs)
+		debug.SetMemoryLimit(origMemLimit)
+	}()
+	for _, prof := range []struct {
+		label string
+		procs int
+		memMB int64
+	}{
+		{"Sim-1vCPU-512MB", 1, 512},
+		{"Sim-1vCPU-1GB", 1, 1024},
+		{"Sim-2vCPU-2GB", 2, 2048},
+	} {
+		runtime.GOMAXPROCS(prof.procs)
+		debug.SetMemoryLimit(prof.memMB << 20)
+		runtime.GC()
+		var idleMem runtime.MemStats
+		runtime.ReadMemStats(&idleMem)
+		run3Median(fmt.Sprintf("%s (idleHeap=%dKB)", prof.label, idleMem.HeapAlloc/1024), "/v1/chat/completions", `{"model":"glm-5.3-flash","stream":true,"messages":[{"role":"user","content":"Hello"}]}`, 200, 10, 16)
+	}
+
 	t.Logf("MAX UPSTREAM CONNS OBSERVED=%d | FINAL GOROUTINES=%d", atomic.LoadInt32(&maxUpstreamConns), runtime.NumGoroutine())
+}
+
+func extractEnterNano(raw []byte) int64 {
+	for _, marker := range [][]byte{[]byte(`"id":"msg_`), []byte(`"enter_ns":`)} {
+		idx := bytes.Index(raw, marker)
+		if idx < 0 {
+			continue
+		}
+		rest := raw[idx+len(marker):]
+		var n int64
+		digits := 0
+		for i := 0; i < len(rest); i++ {
+			if rest[i] >= '0' && rest[i] <= '9' {
+				n = n*10 + int64(rest[i]-'0')
+				digits++
+			} else {
+				break
+			}
+		}
+		if digits >= 10 {
+			return n
+		}
+	}
+	return 0
 }

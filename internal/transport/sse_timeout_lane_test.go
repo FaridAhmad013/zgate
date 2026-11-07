@@ -326,6 +326,141 @@ func TestLaneConcurrencyEnforcementAndLifecycle(t *testing.T) {
 	runtime.GC()
 }
 
+func TestLaneAndAccountConcurrencyBehavior(t *testing.T) {
+	jwt1 := testJWT("u_acct1")
+	jwt2 := testJWT("u_acct2")
+
+	var mu sync.Mutex
+	inFlightByToken := map[string]int{}
+	maxInFlightByToken := map[string]int{}
+	attemptsByToken := map[string]int{}
+	enforce3008OnConcurrentSameAccount := false
+
+	setupTransportTest(t, func(w http.ResponseWriter, r *http.Request) {
+		tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		mu.Lock()
+		attemptsByToken[tok]++
+		inFlightByToken[tok]++
+		cur := inFlightByToken[tok]
+		if cur > maxInFlightByToken[tok] {
+			maxInFlightByToken[tok] = cur
+		}
+		reject := enforce3008OnConcurrentSameAccount && cur > 1
+		mu.Unlock()
+
+		defer func() {
+			mu.Lock()
+			inFlightByToken[tok]--
+			mu.Unlock()
+		}()
+
+		if reject {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"code":3008,"msg":"account concurrency limit exceeded"}`))
+			return
+		}
+		time.Sleep(40 * time.Millisecond)
+		writeOK(w)
+	})
+
+	_, _ = accounts.UpsertAccount("a1", "Account-1", jwt1, "", "", 0)
+	_, _ = accounts.UpsertAccount("a2", "Account-2", jwt2, "", "", 0)
+	accounts.SetDefault("a1")
+
+	// Case 1: With ZCODE_LANE_WIDTH=2 and no upstream 3008 rejection, Usable() is
+	// failover-ordered (default account first, NOT round-robin), so both concurrent
+	// lane slots select the default account (a1) simultaneously!
+	t.Setenv("ZCODE_LANE_WIDTH", "2")
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res, err := SendAnthropic(SendOpts{
+				Body: map[string]any{"model": "glm-5.3-flash", "messages": []any{map[string]any{"role": "user", "content": "hi"}}},
+			})
+			if err != nil {
+				t.Errorf("Case 1 SendAnthropic failed: %v", err)
+				return
+			}
+			res.Body.Close()
+		}()
+	}
+	wg.Wait()
+
+	mu.Lock()
+	maxA1 := maxInFlightByToken["Bearer "+jwt1]
+	if maxA1 == 0 {
+		maxA1 = maxInFlightByToken[jwt1]
+	}
+	attemptsA2 := attemptsByToken[jwt2]
+	inFlightByToken = map[string]int{}
+	maxInFlightByToken = map[string]int{}
+	attemptsByToken = map[string]int{}
+	enforce3008OnConcurrentSameAccount = true
+	mu.Unlock()
+
+	if maxA1 < 2 || attemptsA2 != 0 {
+		t.Fatalf("expected both concurrent lane slots to hit default account a1 first (maxA1=%d, attemptsA2=%d)", maxA1, attemptsA2)
+	}
+
+	// Case 2: When upstream enforces 1 concurrent request per account (429 code 3008)
+	// and ZCODE_LANE_WIDTH=2 with 2 accounts, the 2nd concurrent request receives 3008
+	// on a1, places a1 in short concurrency cooldown, and immediately rotates to a2!
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res, err := SendAnthropic(SendOpts{
+				Body: map[string]any{"model": "glm-5.3-flash", "messages": []any{map[string]any{"role": "user", "content": "rotate"}}},
+			})
+			if err != nil {
+				t.Errorf("Case 2 SendAnthropic failed: %v", err)
+				return
+			}
+			res.Body.Close()
+		}()
+	}
+	wg.Wait()
+
+	mu.Lock()
+	usedA1 := attemptsByToken[jwt1]
+	usedA2 := attemptsByToken[jwt2]
+	mu.Unlock()
+	if usedA1 == 0 || usedA2 == 0 {
+		t.Fatalf("expected 3008 on a1 to rotate the second concurrent request to a2 (usedA1=%d, usedA2=%d)", usedA1, usedA2)
+	}
+
+	// Case 3: Why ZCODE_LANE_WIDTH=8 is unsafe with only 2 accounts when upstream
+	// enforces 1 active stream per account and ZCODE_MAX_ATTEMPTS=1:
+	// 8 concurrent requests enter the lane at once, exhausting both a1 and a2!
+	accounts.ClearCooldown("a1")
+	accounts.ClearCooldown("a2")
+	t.Setenv("ZCODE_LANE_WIDTH", "8")
+	t.Setenv("ZCODE_MAX_ATTEMPTS", "1")
+	var successes, failures int32
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res, err := SendAnthropic(SendOpts{
+				Body: map[string]any{"model": "glm-5.3-flash", "messages": []any{map[string]any{"role": "user", "content": "over-lane"}}},
+			})
+			if err != nil {
+				atomic.AddInt32(&failures, 1)
+				return
+			}
+			res.Body.Close()
+			atomic.AddInt32(&successes, 1)
+		}()
+	}
+	wg.Wait()
+	if atomic.LoadInt32(&failures) == 0 {
+		t.Fatalf("expected concurrent 3008 failures when ZCODE_LANE_WIDTH=8 exceeds 2 accounts' upstream capacity (successes=%d, failures=%d)", successes, failures)
+	}
+}
+
 func jsonRead(r io.Reader, out any) error {
 	b, err := io.ReadAll(r)
 	if err != nil {

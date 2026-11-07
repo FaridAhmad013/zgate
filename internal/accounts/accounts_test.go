@@ -1,6 +1,7 @@
 package accounts
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -387,5 +388,84 @@ func TestConcurrentRefreshSingleflightPerAccount(t *testing.T) {
 	}
 	if !foundFail.NeedsReauth {
 		t.Fatal("failed refresh must mark account NeedsReauth=true")
+	}
+}
+
+func TestAccountCacheConsistencyOnInsertDeleteRefreshExternalEditAndCorrupt(t *testing.T) {
+	path := setupTestAccounts(t)
+
+	// 1. Account insertion immediately updates cached store.
+	jwt1 := makeTestJWT("u_c1", 0)
+	jwt2 := makeTestJWT("u_c2", 0)
+	if _, err := UpsertAccount("c1", "Cache1", jwt1, "rt-c1", "", 0); err != nil {
+		t.Fatalf("UpsertAccount c1: %v", err)
+	}
+	if _, err := UpsertAccount("c2", "Cache2", jwt2, "rt-c2", "", 0); err != nil {
+		t.Fatalf("UpsertAccount c2: %v", err)
+	}
+	if got := len(Usable(nil)); got != 2 {
+		t.Fatalf("expected 2 usable accounts after insert, got %d", got)
+	}
+
+	// 2. Account deletion immediately invalidates deleted entry from cache.
+	if !Remove("c2") {
+		t.Fatal("Remove(c2) returned false")
+	}
+	usable := Usable(nil)
+	if len(usable) != 1 || usable[0].ID != "c1" {
+		t.Fatalf("expected only c1 after Remove(c2), got: %+v", usable)
+	}
+
+	// 3. Token refresh immediately reflects new JWT in Usable().
+	refreshedJWT := makeTestJWT("u_c1_fresh", 0)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"code": 0,
+			"data": map[string]any{"token": refreshedJWT, "zai": map[string]any{"refresh_token": "rt-c1-2"}},
+		})
+	}))
+	defer srv.Close()
+	origOAuth := auth.OAuthBase
+	auth.OAuthBase = srv.URL
+	defer func() { auth.OAuthBase = origOAuth }()
+
+	if _, _, err := RefreshAccountSingleflight(context.Background(), "c1", jwt1); err != nil {
+		t.Fatalf("RefreshAccountSingleflight: %v", err)
+	}
+	if got := Usable(nil); len(got) != 1 || got[0].JWT != refreshedJWT {
+		t.Fatalf("expected refreshed JWT in Usable(), got: %+v", got)
+	}
+
+	// 4. External file modification of identical byte length within the same clock tick
+	// is immediately detected via content comparison (bytes.Equal(raw, lastGoodRaw)).
+	rawOnDisk, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	modifiedRaw := bytes.ReplaceAll(rawOnDisk, []byte(`"Cache1"`), []byte(`"Edit99"`))
+	if len(modifiedRaw) != len(rawOnDisk) {
+		t.Fatalf("expected identical byte length for in-place edit test")
+	}
+	if err := os.WriteFile(path, modifiedRaw, 0o600); err != nil {
+		t.Fatalf("external WriteFile: %v", err)
+	}
+	loaded, err := Load()
+	if err != nil || len(loaded) != 1 || loaded[0].Label != "Edit99" {
+		t.Fatalf("external same-size file edit not detected by cache: err=%v loaded=%+v", err, loaded)
+	}
+
+	// 5. External corruption immediately triggers ErrCorruptStore and blocks overwriting.
+	if err := os.WriteFile(path, []byte(`{"version":1,"accounts":[corrupt`), 0o600); err != nil {
+		t.Fatalf("corrupt WriteFile: %v", err)
+	}
+	fallback, loadErr := Load()
+	if !errors.Is(loadErr, ErrCorruptStore) {
+		t.Fatalf("expected ErrCorruptStore on corrupt external edit, got: %v", loadErr)
+	}
+	if len(fallback) != 1 || fallback[0].Label != "Edit99" {
+		t.Fatalf("expected lastGoodStore fallback (Edit99) during corruption, got: %+v", fallback)
+	}
+	if _, err := UpsertAccount("c3", "Cache3", jwt2, "", "", 0); !errors.Is(err, ErrCorruptStore) {
+		t.Fatalf("UpsertAccount must refuse to overwrite corrupt file, got: %v", err)
 	}
 }
