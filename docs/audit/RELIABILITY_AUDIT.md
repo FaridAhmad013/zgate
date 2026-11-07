@@ -91,6 +91,22 @@ Audit scope: commit `9e6279e` on branch `feature/security-hardening`. Verified v
 
 ---
 
+### REL-12 — Unbounded Per-Account Concurrency & Failover Selection Bias
+- **Location:** `internal/transport/transport.go:415-460`, `internal/accounts/accounts.go:490-530`
+- **Problem:** `accounts.Usable()` ordered accounts in strict failover order (default account always first, never round-robin), while `SendAnthropic` only enforced a global process lane (`ZCODE_LANE_WIDTH`). When `ZCODE_LANE_WIDTH > 1` (e.g. 4 or 8), all concurrent requests selected the same default account simultaneously, triggering upstream account-concurrency blocks (`429 code 3008`).
+- **Remediation (Phase 6.1, ADR 0002):** Implemented `accounts.AcquireCandidate` combining a per-account concurrency semaphore (`ZCODE_ACCOUNT_CONCURRENCY`, default `1`), least-in-flight sorting, and round-robin sequence tracking (`selectSeq`).
+- **Status:** **Fixed** in Phase 6.1. Verified by `TestLaneAndAccountConcurrencyBehavior`.
+
+---
+
+### REL-13 — Redundant File I/O & Storage Lock Contention on Account Selection
+- **Location:** `internal/accounts/accounts.go:190-270`
+- **Problem:** `loadStore()` read and unmarshaled `accounts.json` from disk on every candidate selection, becoming a CPU and mutex bottleneck under concurrent load.
+- **Remediation (Phase 6.1, ADR 0002):** Implemented content-validated cache with burst suppression (<5ms) and `os.Stat` metadata validation (>25ms), retaining byte-level verification on writes and external edits.
+- **Status:** **Fixed** in Phase 6.1. Verified by `TestAccountCacheConsistencyOnInsertDeleteRefreshExternalEditAndCorrupt` and benchmarks.
+
+---
+
 ### REL-07 — Concurrent `401` Responses Trigger Duplicate Token Refreshes (Race / Thundering Herd)
 - **Location:** `internal/transport/transport.go:435-468`, `internal/accounts/accounts.go:365-399`
 - **Problem:** Neither `runAccount` nor `TryRefreshAccount` serializes refresh calls per account. When 5 concurrent requests use the same expired/revoked account, all 5 receive `401`, and all 5 simultaneously send `POST /api/v1/oauth/token` with the same `refresh_token` and overwrite `accounts.json`. OAuth servers with refresh-token rotation invalidate the `refresh_token` on first use, causing the other 4 concurrent refresh calls to fail and potentially revoking the token family.
