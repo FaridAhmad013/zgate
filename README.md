@@ -81,11 +81,22 @@ curl -X POST http://127.0.0.1:8085/v1/messages \
 
 | Variable | Default | Description |
 |---|---|---|
-| `PORT` | `20131` | Listening port |
-| `BIND_HOST` | `127.0.0.1` | Network interface to bind |
+| `PORT` | `20131` | Listening port (`1`–`65535`) |
+| `BIND_HOST` | `127.0.0.1` | Network interface to bind (takes priority over `HOST` if both are set) |
+| `HOST` | `127.0.0.1` | Fallback network interface to bind when `BIND_HOST` is unset |
+| `ZCODE_BRIDGE_TOKEN` | - | API token (`Authorization: Bearer <token>` or `X-Api-Key`). **Mandatory** when binding to any non-loopback address (`0.0.0.0`, LAN/public IP, or external hostname) |
+| `ZCODE_ALLOWED_HOSTS` | - | Comma-separated exact `Host` header allowlist for reverse-proxy deployments (`X-Forwarded-Host` is not trusted unless rewritten into `Host` by a trusted reverse proxy) |
+| `ZCODE_CORS_ORIGIN` | - | Comma-separated exact browser origins (`https://...`) allowed for CORS (`*` wildcards are rejected) |
 | `ZCODE_DEFAULT_EFFORT` | `low` | Default reasoning effort when unspecified (`low`, `high`, `max`) |
 | `ZCODE_PLAN_JWT` | - | Manual Plan JWT override |
 | `ZCODE_IDENTITY_DEVICE_MID` | Auto | Device identifier (auto-detected on Windows) |
+
+### Reverse Proxy & Network Security Notes
+
+- **Default Binding**: Binds to `127.0.0.1:20131`. If both `BIND_HOST` and `HOST` are set, `BIND_HOST` takes precedence.
+- **Non-Loopback Startup Gate**: Binding to a non-loopback address (e.g., `0.0.0.0` or a private/public IP) without setting `ZCODE_BRIDGE_TOKEN` causes startup to fail immediately.
+- **Endpoint Authentication**: When `ZCODE_BRIDGE_TOKEN` is set, `/health`, `/v1/models`, `/models`, `/v1/quota`, `/quota`, `/v1/messages`, and `/v1/chat/completions` all require `Authorization: Bearer <token>` or `X-Api-Key: <token>`. `/healthz` remains an unauthenticated minimal liveness check (`{"ok":true}`).
+- **Trusted Reverse Proxy**: The gateway validates the HTTP `Host` header against the bind host and `ZCODE_ALLOWED_HOSTS` and does **not** trust `X-Forwarded-Host` from clients. Configure your reverse proxy (Nginx/Caddy/Traefik) to set `Host` to `127.0.0.1:20131` or add the public hostname to `ZCODE_ALLOWED_HOSTS`.
 
 ## License
 
