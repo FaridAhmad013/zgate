@@ -92,6 +92,7 @@ func requestIDFor(r *http.Request) string {
 }
 
 func logRequest(reqID, method, path string, status int, dur time.Duration, eventTag string) {
+	recordTrafficLog(reqID, method, path, status, dur, eventTag)
 	c := getConfig()
 	logFn := c.LogFunc
 	if logFn == nil {

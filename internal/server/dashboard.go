@@ -25,10 +25,41 @@ type loginFlowEntry struct {
 	createdAt time.Time
 }
 
+type trafficLogEntry struct {
+	Timestamp string `json:"timestamp"`
+	ReqID     string `json:"req_id"`
+	Method    string `json:"method"`
+	Path      string `json:"path"`
+	Status    int    `json:"status"`
+	Duration  int64  `json:"duration_ms"`
+	EventTag  string `json:"event_tag,omitempty"`
+}
+
 var (
 	loginFlowsMu sync.Mutex
 	loginFlows   = map[string]*loginFlowEntry{}
+
+	trafficMu   sync.RWMutex
+	trafficLogs []trafficLogEntry
 )
+
+func recordTrafficLog(reqID, method, path string, status int, dur time.Duration, eventTag string) {
+	trafficMu.Lock()
+	defer trafficMu.Unlock()
+	entry := trafficLogEntry{
+		Timestamp: time.Now().Format("15:04:05"),
+		ReqID:     reqID,
+		Method:    method,
+		Path:      path,
+		Status:    status,
+		Duration:  dur.Milliseconds(),
+		EventTag:  eventTag,
+	}
+	trafficLogs = append(trafficLogs, entry)
+	if len(trafficLogs) > 40 {
+		trafficLogs = trafficLogs[len(trafficLogs)-40:]
+	}
+}
 
 func resolveAdminKey() string {
 	return strings.TrimSpace(os.Getenv("GATEWAY_ADMIN_KEY"))
@@ -39,7 +70,6 @@ func isDashboardAuthorized(r *http.Request) bool {
 	if adminKey == "" {
 		return true // No password set: open dashboard
 	}
-	// Check Cookie "gateway_admin_session" or Header "Authorization: Bearer <key>"
 	if authHeader := r.Header.Get("Authorization"); authHeader != "" {
 		presented := strings.TrimPrefix(authHeader, "Bearer ")
 		presented = strings.TrimPrefix(presented, "bearer ")
@@ -128,12 +158,18 @@ func handleDashboardStatus(w http.ResponseWriter, r *http.Request) {
 		authMode = "Bridge Token Required"
 	}
 
+	trafficMu.RLock()
+	logsCopy := make([]trafficLogEntry, len(trafficLogs))
+	copy(logsCopy, trafficLogs)
+	trafficMu.RUnlock()
+
 	sendJSON(w, http.StatusOK, map[string]any{
 		"ok":          true,
 		"auth":        authMode,
 		"bridgeToken": c.BridgeToken,
 		"laneWidth":   laneWidth,
 		"accounts":    ring,
+		"logs":        logsCopy,
 	})
 }
 
@@ -161,7 +197,6 @@ func handleDashboardLoginStart(w http.ResponseWriter, r *http.Request) {
 		label:     req.Label,
 		createdAt: time.Now(),
 	}
-	// Prune old flows (> 10 minutes)
 	for k, v := range loginFlows {
 		if time.Since(v.createdAt) > 10*time.Minute {
 			delete(loginFlows, k)
