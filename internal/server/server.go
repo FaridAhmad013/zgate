@@ -386,21 +386,20 @@ func isJSON(raw []byte) bool {
 	return json.Unmarshal(raw, &m) == nil
 }
 
-// pipeStream streams upstream SSE frames to the caller. Anthropic frames
-// pass through untouched; OpenAI callers get frames rewritten into
-// chat.completion.chunk.
+// pipeStream streams upstream SSE frames to the caller using the bounded
+// transport.SSEReader. Anthropic frames are forwarded with error redaction;
+// OpenAI callers get frames rewritten into chat.completion.chunk.
 func pipeStream(w http.ResponseWriter, upstream *http.Response, dialect, model string) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(200)
+	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
 
-	reader := upstream.Body
-	buf := make([]byte, 16<<10)
-	var carry string
 	streamState := &chunkState{toolByBlock: map[float64]int{}, nextToolIndex: 0}
+	sse := transport.NewSSEReader(upstream.Body, 0)
+	doneSent := false
 
 	writeSSE := func(frame string) bool {
 		if _, err := io.WriteString(w, frame); err != nil {
@@ -412,111 +411,115 @@ func pipeStream(w http.ResponseWriter, upstream *http.Response, dialect, model s
 		return true
 	}
 
-	for {
-		n, err := reader.Read(buf)
-		if n > 0 {
-			carry += string(buf[:n])
-			if dialect != "openai" {
-				if !writeSSE(string(buf[:n])) {
-					return
-				}
-				carry = ""
-			} else {
-				for {
-					idx := strings.Index(carry, "\n\n")
-					if idx < 0 {
-						break
-					}
-					frame := carry[:idx]
-					carry = carry[idx+2:]
-					var dataLine string
-					for _, line := range strings.Split(frame, "\n") {
-						if strings.HasPrefix(line, "data:") {
-							dataLine = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-							break
-						}
-					}
-					if dataLine == "" || dataLine == "[DONE]" {
-						continue
-					}
-					var event map[string]any
-					if json.Unmarshal([]byte(dataLine), &event) != nil {
-						continue
-					}
-					if chunk := toOpenAIChunk(event, model, streamState); chunk != nil {
-						encoded, _ := json.Marshal(chunk)
-						if !writeSSE("data: " + string(encoded) + "\n\n") {
-							return
-						}
-					}
-					if event["type"] == "message_stop" {
-						if !writeSSE("data: [DONE]\n\n") {
-							return
-						}
-					}
-				}
-			}
+	emitStreamError := func(msg, errType string) {
+		safeMsg := redactMsg(msg)
+		if safeMsg == "" {
+			safeMsg = "upstream stream error"
 		}
+		if dialect == "openai" {
+			if errType == "" {
+				errType = "upstream_error"
+			}
+			frame, _ := json.Marshal(map[string]any{"error": map[string]any{"message": safeMsg, "type": errType}})
+			_ = writeSSE("data: " + string(frame) + "\n\n")
+			if !doneSent {
+				doneSent = true
+				_ = writeSSE("data: [DONE]\n\n")
+			}
+		} else {
+			if errType == "" {
+				errType = "api_error"
+			}
+			frame, _ := json.Marshal(map[string]any{"type": "error", "error": map[string]any{"type": errType, "message": safeMsg}})
+			_ = writeSSE("event: error\ndata: " + string(frame) + "\n\n")
+		}
+	}
+
+	for {
+		ev, err := sse.Next()
 		if err != nil {
-			// Drain any buffered frame before the EOF/error.
+			if err != io.EOF {
+				emitStreamError(err.Error(), "")
+			}
+			return
+		}
+
+		data := strings.TrimSpace(ev.Data)
+		if data == "[DONE]" {
 			if dialect == "openai" {
-				if leftover := flushOpenAIFrame(carry, model, streamState); leftover != "" {
-					if !writeSSE(leftover) {
+				if !doneSent {
+					doneSent = true
+					if !writeSSE("data: [DONE]\n\n") {
 						return
 					}
 				}
-			} else if carry != "" {
-				if !writeSSE(carry) {
-					return
-				}
+			} else if !writeSSE("data: [DONE]\n\n") {
+				return
 			}
-			if err != io.EOF {
-				// Stream aborted mid-way: report in-band.
-				safeErr := redactMsg(err.Error())
-				if dialect == "openai" {
-					frame, _ := json.Marshal(map[string]any{"error": map[string]any{"message": safeErr, "type": "upstream_error"}})
-					_ = writeSSE("data: " + string(frame) + "\n\n")
-				} else {
-					frame, _ := json.Marshal(map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": safeErr}})
-					_ = writeSSE("data: " + string(frame) + "\n\n")
-				}
+			continue
+		}
+		if data == "" {
+			continue
+		}
+
+		var event map[string]any
+		if json.Unmarshal([]byte(data), &event) != nil || event == nil {
+			if strings.EqualFold(ev.Event, "error") {
+				emitStreamError(data, "")
+				return
 			}
+			continue
+		}
+
+		if strings.EqualFold(ev.Event, "error") || stringOf(event["type"]) == "error" {
+			errMsg, errType := extractStreamError(event)
+			emitStreamError(errMsg, errType)
 			return
+		}
+
+		if dialect != "openai" {
+			var frame strings.Builder
+			if ev.Event != "" {
+				frame.WriteString("event: ")
+				frame.WriteString(ev.Event)
+				frame.WriteByte('\n')
+			}
+			for _, line := range strings.Split(ev.Data, "\n") {
+				frame.WriteString("data: ")
+				frame.WriteString(line)
+				frame.WriteByte('\n')
+			}
+			frame.WriteByte('\n')
+			if !writeSSE(frame.String()) {
+				return
+			}
+			continue
+		}
+
+		if chunk := toOpenAIChunk(event, model, streamState); chunk != nil {
+			encoded, _ := json.Marshal(chunk)
+			if !writeSSE("data: " + string(encoded) + "\n\n") {
+				return
+			}
+		}
+		if event["type"] == "message_stop" && !doneSent {
+			doneSent = true
+			if !writeSSE("data: [DONE]\n\n") {
+				return
+			}
 		}
 	}
 }
 
-// flushOpenAIFrame converts one buffered SSE frame (possibly without its
-// trailing blank line) into an OpenAI chunk write; returns the bytes to
-// write or "" when nothing translatable remains.
-func flushOpenAIFrame(frame, model string, state *chunkState) string {
-	var dataLine string
-	for _, line := range strings.Split(frame, "\n") {
-		if strings.HasPrefix(line, "data:") {
-			dataLine = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			break
+func extractStreamError(event map[string]any) (string, string) {
+	if errObj, ok := event["error"].(map[string]any); ok {
+		msg := firstNonEmpty(stringOf(errObj["message"]), stringOf(errObj["msg"]))
+		typ := stringOf(errObj["type"])
+		if msg != "" {
+			return msg, typ
 		}
 	}
-	if dataLine == "" || dataLine == "[DONE]" {
-		return ""
-	}
-	var event map[string]any
-	if json.Unmarshal([]byte(dataLine), &event) != nil {
-		return ""
-	}
-	chunk := toOpenAIChunk(event, model, state)
-	if chunk == nil {
-		if event["type"] == "message_stop" {
-			return "data: [DONE]\n\n"
-		}
-		return ""
-	}
-	encoded, _ := json.Marshal(chunk)
-	out := "data: " + string(encoded) + "\n\n"
-	if event["type"] == "message_stop" {
-		out += "data: [DONE]\n\n"
-	}
-	return out
+	return firstNonEmpty(stringOf(event["message"]), stringOf(event["msg"]), "upstream stream error"), ""
 }
 
 // chunkState tracks Anthropic block indexes -> OpenAI tool_call indexes.

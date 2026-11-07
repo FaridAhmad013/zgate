@@ -30,6 +30,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -598,3 +599,169 @@ func firstNonEmpty(vals ...string) string {
 
 // osGetenv exists so tests can stub the environment.
 var osGetenv = os.Getenv
+
+// DefaultMaxSSEEventBytes caps the memory a single SSE event may buffer.
+const DefaultMaxSSEEventBytes = 2 << 20
+
+// ErrSSEEventTooLarge is returned when an upstream SSE stream exceeds the
+// configured per-event buffer limit without terminating the event.
+var ErrSSEEventTooLarge = errors.New("upstream SSE event exceeded buffer limit")
+
+// SSEEvent represents one parsed Server-Sent Event frame.
+type SSEEvent struct {
+	Event string
+	Data  string
+}
+
+// SSEReader parses an SSE stream across arbitrary chunk boundaries,
+// supporting LF, CRLF, and CR line endings, multiline data fields, and a hard
+// per-event buffer bound.
+type SSEReader struct {
+	r             io.Reader
+	maxEventBytes int
+	readBuf       [16 << 10]byte
+	pos           int
+	end           int
+	pendingCR     bool
+	eof           bool
+	readErr       error
+
+	lineBuf    bytes.Buffer
+	dataBuf    bytes.Buffer
+	eventType  string
+	hasData    bool
+	eventBytes int
+}
+
+// NewSSEReader returns a bounded SSE event reader. If maxEventBytes <= 0,
+// DefaultMaxSSEEventBytes (2 MiB) is used.
+func NewSSEReader(r io.Reader, maxEventBytes int) *SSEReader {
+	if maxEventBytes <= 0 {
+		maxEventBytes = DefaultMaxSSEEventBytes
+	}
+	return &SSEReader{r: r, maxEventBytes: maxEventBytes}
+}
+
+// Next reads and returns the next non-empty SSE event from the stream, or
+// io.EOF when the stream ends cleanly.
+func (s *SSEReader) Next() (SSEEvent, error) {
+	for {
+		line, hasLine, err := s.readLine()
+		if hasLine {
+			if len(line) == 0 {
+				if s.hasData || s.eventType != "" {
+					ev := SSEEvent{Event: s.eventType, Data: s.dataBuf.String()}
+					s.resetEvent()
+					return ev, nil
+				}
+			} else if err := s.consumeLine(line); err != nil {
+				s.resetEvent()
+				return SSEEvent{}, err
+			}
+		}
+		if err != nil {
+			if err == io.EOF && (s.hasData || s.eventType != "") {
+				ev := SSEEvent{Event: s.eventType, Data: s.dataBuf.String()}
+				s.resetEvent()
+				return ev, nil
+			}
+			s.resetEvent()
+			return SSEEvent{}, err
+		}
+	}
+}
+
+func (s *SSEReader) resetEvent() {
+	s.eventType = ""
+	s.dataBuf.Reset()
+	s.hasData = false
+	s.eventBytes = 0
+}
+
+func (s *SSEReader) consumeLine(line []byte) error {
+	s.eventBytes += len(line)
+	if s.eventBytes > s.maxEventBytes {
+		return ErrSSEEventTooLarge
+	}
+	if line[0] == ':' {
+		return nil // SSE comment
+	}
+	field, val, hasColon := bytes.Cut(line, []byte{':'})
+	if hasColon && len(val) > 0 && val[0] == ' ' {
+		val = val[1:]
+	}
+	switch string(field) {
+	case "event":
+		s.eventType = strings.TrimSpace(string(val))
+	case "data":
+		if s.hasData {
+			s.dataBuf.WriteByte('\n')
+		}
+		s.dataBuf.Write(val)
+		s.hasData = true
+	}
+	return nil
+}
+
+func (s *SSEReader) readLine() ([]byte, bool, error) {
+	s.lineBuf.Reset()
+	for {
+		if s.pos >= s.end {
+			if s.eof {
+				if s.lineBuf.Len() > 0 {
+					out := append([]byte(nil), s.lineBuf.Bytes()...)
+					s.lineBuf.Reset()
+					return out, true, nil
+				}
+				return nil, false, io.EOF
+			}
+			if s.readErr != nil {
+				err := s.readErr
+				s.readErr = nil
+				if s.lineBuf.Len() > 0 {
+					out := append([]byte(nil), s.lineBuf.Bytes()...)
+					s.lineBuf.Reset()
+					return out, true, err
+				}
+				return nil, false, err
+			}
+			n, err := s.r.Read(s.readBuf[:])
+			s.pos = 0
+			s.end = n
+			if err != nil {
+				if err == io.EOF {
+					s.eof = true
+				} else {
+					s.readErr = err
+				}
+			}
+			if n == 0 {
+				continue
+			}
+		}
+
+		b := s.readBuf[s.pos]
+		s.pos++
+		if s.pendingCR {
+			s.pendingCR = false
+			if b == '\n' {
+				continue
+			}
+		}
+		if b == '\r' {
+			s.pendingCR = true
+			out := append([]byte(nil), s.lineBuf.Bytes()...)
+			s.lineBuf.Reset()
+			return out, true, nil
+		}
+		if b == '\n' {
+			out := append([]byte(nil), s.lineBuf.Bytes()...)
+			s.lineBuf.Reset()
+			return out, true, nil
+		}
+		if s.lineBuf.Len()+s.eventBytes+1 > s.maxEventBytes {
+			return nil, false, ErrSSEEventTooLarge
+		}
+		s.lineBuf.WriteByte(b)
+	}
+}
