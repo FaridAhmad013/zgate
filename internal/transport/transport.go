@@ -277,38 +277,57 @@ func ShapePlanBody(body map[string]any, sessionID, deviceID, accountUUID string)
 var (
 	laneMu  sync.Mutex
 	laneSem chan struct{}
-	laneWg  sync.WaitGroup
 )
 
-func laneSlot() chan struct{} {
-	laneOnce.Do(func() {
-		width := 1
-		if v := osGetenv("ZCODE_LANE_WIDTH"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n > 0 {
-				width = n
-			}
+func resolveLaneWidth() int {
+	if v := strings.TrimSpace(osGetenv("ZCODE_LANE_WIDTH")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
 		}
-		laneSem = make(chan struct{}, width)
-	})
+	}
+	return 1
+}
+
+func laneSlot() chan struct{} {
+	want := resolveLaneWidth()
+	laneMu.Lock()
+	defer laneMu.Unlock()
+	if laneSem == nil || (cap(laneSem) != want && len(laneSem) == 0) {
+		laneSem = make(chan struct{}, want)
+	}
 	return laneSem
 }
 
-var laneOnce sync.Once
-
-// WithLane serializes inference calls through one lane (the gateway enforces
-// a per-account in-flight limit shared with the desktop client: 429 3008
-// user / 3009 model), so concurrent bridge clients queue instead of
-// collectively tripping the limit.
-func WithLane(ctx context.Context, fn func() error) error {
-	laneWg.Add(1)
-	defer laneWg.Done()
-	select {
-	case laneSlot() <- struct{}{}:
-		defer func() { <-laneSlot() }()
-		return fn()
-	case <-ctx.Done():
-		return ctx.Err()
+func acquireLane(ctx context.Context) (func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	sem := laneSlot()
+	select {
+	case sem <- struct{}{}:
+		var once sync.Once
+		return func() {
+			once.Do(func() { <-sem })
+		}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// WithLane serializes inference calls through the configured concurrency lane
+// (ZCODE_LANE_WIDTH, default 1). The gateway enforces a per-account in-flight
+// limit shared with the desktop client (429 3008 user / 3009 model), so
+// concurrent bridge clients queue instead of collectively tripping the limit.
+func WithLane(ctx context.Context, fn func() error) error {
+	release, err := acquireLane(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return fn()
 }
 
 // ErrStreamIdleTimeout is returned when an active stream receives no data
@@ -388,6 +407,25 @@ func SendAnthropic(o SendOpts) (*http.Response, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// Pre-flight check outside the lane so missing credentials fail fast
+	// without acquiring or holding a lane slot.
+	if _, err := Candidates(o.JWT, o.AccountID); err != nil {
+		return nil, err
+	}
+
+	releaseLane, err := acquireLane(ctx)
+	if err != nil {
+		return nil, &UpstreamError{Msg: "client went away", Status: 499, Kind: "upstream"}
+	}
+	laneTransferred := false
+	defer func() {
+		if !laneTransferred {
+			releaseLane()
+		}
+	}()
+
+	// Re-resolve candidates inside the lane so cooldowns or token refreshes
+	// performed by an earlier lane holder are immediately visible.
 	cands, err := Candidates(o.JWT, o.AccountID)
 	if err != nil {
 		return nil, err
@@ -427,6 +465,12 @@ func SendAnthropic(o SendOpts) (*http.Response, error) {
 			if acct.ID != "" {
 				accounts.ClearCooldown(acct.ID)
 			}
+			if cb, ok := res.Body.(*cancelBody); ok {
+				cb.release = releaseLane
+			} else {
+				res.Body = &cancelBody{ReadCloser: res.Body, release: releaseLane}
+			}
+			laneTransferred = true
 			return res, nil
 		}
 		ue, ok := err.(*UpstreamError)
