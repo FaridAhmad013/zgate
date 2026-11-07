@@ -15,15 +15,22 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/apissaj/zcode-gateway/internal/accounts"
+	"github.com/apissaj/zcode-gateway/internal/auth"
 	"github.com/apissaj/zcode-gateway/internal/models"
 	"github.com/apissaj/zcode-gateway/internal/quota"
 	"github.com/apissaj/zcode-gateway/internal/transport"
@@ -39,14 +46,121 @@ type Config struct {
 	ModelsCache time.Duration
 }
 
-var cfg Config
+var (
+	cfgMu sync.RWMutex
+	cfg   = Config{Host: "127.0.0.1", Port: 20131, ModelsCache: 30 * time.Second}
+)
+
+var hostnamePattern = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$`)
+
+// ResolveBindHost resolves the network bind address from environment variables.
+// Priority: BIND_HOST -> HOST -> "127.0.0.1".
+func ResolveBindHost() string {
+	if v := strings.TrimSpace(os.Getenv("BIND_HOST")); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(os.Getenv("HOST")); v != "" {
+		return v
+	}
+	return "127.0.0.1"
+}
+
+// ValidateHost validates that host is a syntactically valid IP address or hostname
+// without scheme, path, or port components.
+func ValidateHost(host string) error {
+	h := strings.TrimSpace(host)
+	if h == "" {
+		return errors.New("bind host must not be empty")
+	}
+	if strings.HasPrefix(h, "[") && strings.HasSuffix(h, "]") {
+		h = h[1 : len(h)-1]
+	}
+	if strings.ContainsAny(h, " \t\r\n/\\?#@") {
+		return fmt.Errorf("invalid bind host %q", host)
+	}
+	if ip := net.ParseIP(h); ip != nil {
+		return nil
+	}
+	if strings.Contains(h, ":") {
+		return fmt.Errorf("invalid bind host %q (must not include port or malformed IPv6)", host)
+	}
+	if looksNumericIPv4(h) {
+		return fmt.Errorf("invalid IPv4 bind host %q", host)
+	}
+	if len(h) > 253 || !hostnamePattern.MatchString(h) {
+		return fmt.Errorf("invalid bind host %q", host)
+	}
+	return nil
+}
+
+func looksNumericIPv4(h string) bool {
+	parts := strings.Split(h, ".")
+	for _, p := range parts {
+		if p == "" {
+			return true
+		}
+		for i := 0; i < len(p); i++ {
+			if p[i] < '0' || p[i] > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// IsLoopbackHost reports whether host refers exclusively to the local loopback interface.
+func IsLoopbackHost(host string) bool {
+	h := strings.TrimSpace(host)
+	if strings.HasPrefix(h, "[") && strings.HasSuffix(h, "]") {
+		h = h[1 : len(h)-1]
+	}
+	if strings.EqualFold(h, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(h); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+// ValidateConfig enforces network binding and authentication invariants before startup.
+func ValidateConfig(c Config) error {
+	if err := ValidateHost(c.Host); err != nil {
+		return err
+	}
+	if c.Port < 0 || c.Port > 65535 {
+		return fmt.Errorf("invalid port %d", c.Port)
+	}
+	if !IsLoopbackHost(c.Host) && strings.TrimSpace(c.BridgeToken) == "" {
+		return fmt.Errorf("refusing to bind non-loopback host %q without ZCODE_BRIDGE_TOKEN", c.Host)
+	}
+	return nil
+}
 
 // Configure sets the package-level config before ListenAndServe.
 func Configure(c Config) {
+	if strings.TrimSpace(c.Host) == "" {
+		c.Host = "127.0.0.1"
+	}
 	if c.ModelsCache <= 0 {
 		c.ModelsCache = 30 * time.Second
 	}
+	cfgMu.Lock()
 	cfg = c
+	cfgMu.Unlock()
+	modelsMu.Lock()
+	modelsCache = nil
+	modelsMu.Unlock()
+}
+
+func getConfig() Config {
+	cfgMu.RLock()
+	defer cfgMu.RUnlock()
+	return cfg
+}
+
+func redactMsg(msg string) string {
+	return auth.RedactSecrets(msg, getConfig().BridgeToken)
 }
 
 func sendJSON(w http.ResponseWriter, status int, payload any) {
@@ -62,26 +176,38 @@ func anthropicError(w http.ResponseWriter, status int, message, typ string) {
 	if typ == "" {
 		typ = "api_error"
 	}
-	sendJSON(w, status, map[string]any{"type": "error", "error": map[string]any{"type": typ, "message": message}})
+	sendJSON(w, status, map[string]any{"type": "error", "error": map[string]any{"type": typ, "message": redactMsg(message)}})
 }
 
 func openAIError(w http.ResponseWriter, status int, message string, code any) {
-	sendJSON(w, status, map[string]any{"error": map[string]any{"message": message, "type": "invalid_request_error", "code": code}})
+	sendJSON(w, status, map[string]any{"error": map[string]any{"message": redactMsg(message), "type": "invalid_request_error", "code": code}})
+}
+
+func constantTimeTokenEqual(presented, expected string) bool {
+	if expected == "" || presented == "" {
+		return false
+	}
+	ph := sha256.Sum256([]byte(presented))
+	eh := sha256.Sum256([]byte(expected))
+	hashEq := subtle.ConstantTimeCompare(ph[:], eh[:])
+	lenEq := subtle.ConstantTimeEq(int32(len(presented)), int32(len(expected)))
+	return (hashEq & lenEq) == 1
 }
 
 func authorized(r *http.Request) bool {
-	if cfg.BridgeToken == "" {
-		return true
+	expected := strings.TrimSpace(getConfig().BridgeToken)
+	if expected == "" {
+		return IsLoopbackHost(getConfig().Host)
 	}
 	header := r.Header.Get("Authorization")
 	presented := ""
-	if strings.HasPrefix(strings.ToLower(header), "bearer ") {
+	if len(header) >= 7 && strings.EqualFold(header[:7], "bearer ") {
 		presented = strings.TrimSpace(header[7:])
 	}
 	if presented == "" {
 		presented = strings.TrimSpace(r.Header.Get("X-Api-Key"))
 	}
-	return presented == cfg.BridgeToken
+	return constantTimeTokenEqual(presented, expected)
 }
 
 func readBody(r *http.Request) ([]byte, error) {
@@ -346,11 +472,12 @@ func pipeStream(w http.ResponseWriter, upstream *http.Response, dialect, model s
 			}
 			if err != io.EOF {
 				// Stream aborted mid-way: report in-band.
+				safeErr := redactMsg(err.Error())
 				if dialect == "openai" {
-					frame, _ := json.Marshal(map[string]any{"error": map[string]any{"message": err.Error(), "type": "upstream_error"}})
+					frame, _ := json.Marshal(map[string]any{"error": map[string]any{"message": safeErr, "type": "upstream_error"}})
 					_ = writeSSE("data: " + string(frame) + "\n\n")
 				} else {
-					frame, _ := json.Marshal(map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": err.Error()}})
+					frame, _ := json.Marshal(map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": safeErr}})
 					_ = writeSSE("data: " + string(frame) + "\n\n")
 				}
 			}
@@ -506,7 +633,11 @@ func liveModels(ctx context.Context) any {
 	modelsMu.Lock()
 	defer modelsMu.Unlock()
 	now := time.Now()
-	if modelsCache != nil && now.Sub(modelsCache.at) < cfg.ModelsCache {
+	cacheTTL := getConfig().ModelsCache
+	if cacheTTL <= 0 {
+		cacheTTL = 30 * time.Second
+	}
+	if modelsCache != nil && now.Sub(modelsCache.at) < cacheTTL {
 		return modelsCache.list
 	}
 	var list any = staticModelList()

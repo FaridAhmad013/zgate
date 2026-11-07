@@ -60,7 +60,7 @@ type store struct {
 type Summary struct {
 	ID            string `json:"id"`
 	Label         string `json:"label"`
-	Email         string `json:"email"`
+	Email         string `json:"email,omitempty"`
 	Default       bool   `json:"default"`
 	HasRefresh    bool   `json:"hasRefresh"`
 	ExpiresAt     int64  `json:"expiresAt"`

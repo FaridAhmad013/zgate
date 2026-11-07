@@ -117,21 +117,21 @@ type LLMHeaderOpts struct {
 // anthropicVersion/anthropicBeta come from the identity asset.
 func BuildLLMHeaders(anthropicVersion, anthropicBeta string, o LLMHeaderOpts) map[string]string {
 	h := map[string]string{
-		"http-referer":          "https://zcode.z.ai",
-		"user-agent":            fmt.Sprintf("%s", Printable(os.Getenv("ZCODE_SDK_USER_AGENT"))),
-		"x-title":               "Z Code@electron",
-		"x-release-channel":     envOr("ZCODE_IDENTITY_RELEASE_CHANNEL", "production"),
-		"x-client-language":     resolveClientLanguage(),
-		"x-client-timezone":     resolveClientTimezone(),
-		"x-zcode-agent":         "glm",
-		"x-platform":            resolvePlatform(),
-		"x-os-category":         osCategory(runtime.GOOS),
-		"x-os-version":          envOr("ZCODE_IDENTITY_OS_VERSION", "unknown"),
-		"x-zcode-app-version":   ResolveAppVersion(),
-		"anthropic-version":     anthropicVersion,
-		"anthropic-beta":        anthropicBeta,
-		"x-zcode-session-type":  "main",
-		"x-zcode-query-source":  "main_turn",
+		"http-referer":         "https://zcode.z.ai",
+		"user-agent":           fmt.Sprintf("%s", Printable(os.Getenv("ZCODE_SDK_USER_AGENT"))),
+		"x-title":              "Z Code@electron",
+		"x-release-channel":    envOr("ZCODE_IDENTITY_RELEASE_CHANNEL", "production"),
+		"x-client-language":    resolveClientLanguage(),
+		"x-client-timezone":    resolveClientTimezone(),
+		"x-zcode-agent":        "glm",
+		"x-platform":           resolvePlatform(),
+		"x-os-category":        osCategory(runtime.GOOS),
+		"x-os-version":         envOr("ZCODE_IDENTITY_OS_VERSION", "unknown"),
+		"x-zcode-app-version":  ResolveAppVersion(),
+		"anthropic-version":    anthropicVersion,
+		"anthropic-beta":       anthropicBeta,
+		"x-zcode-session-type": "main",
+		"x-zcode-query-source": "main_turn",
 	}
 	if ua := h["user-agent"]; ua == "" {
 		h["user-agent"] = fmt.Sprintf("ZCode/%s", ResolveAppVersion())

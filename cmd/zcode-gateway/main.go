@@ -110,7 +110,7 @@ func deviceLogin(label string) {
 	ctx := context.Background()
 	flow, err := auth.StartDeviceFlow(ctx)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "login failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "login failed: %s\n", auth.Redact(err.Error()))
 		os.Exit(1)
 	}
 	minutes := int(time.Until(flow.ExpiresAt).Minutes() + 0.5)
@@ -122,7 +122,7 @@ func deviceLogin(label string) {
 
 	result, err := auth.PollDeviceFlow(ctx, flow)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "login failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "login failed: %s\n", auth.Redact(err.Error()))
 		os.Exit(1)
 	}
 	claims, _ := auth.DecodeJWT(result.JWT)
@@ -155,15 +155,14 @@ func orUnknown(s string) string {
 }
 
 func serve() {
-	host := strings.TrimSpace(os.Getenv("HOST"))
-	if host == "" {
-		host = "127.0.0.1"
-	}
 	cfg := server.Config{
 		Port:        envInt("PORT", 20131),
-		Host:        host,
-
+		Host:        server.ResolveBindHost(),
 		BridgeToken: strings.TrimSpace(os.Getenv("ZCODE_BRIDGE_TOKEN")),
+	}
+	if err := server.ValidateConfig(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "configuration error: %s\n", auth.RedactSecrets(err.Error(), cfg.BridgeToken))
+		os.Exit(1)
 	}
 	server.Configure(cfg)
 
@@ -209,7 +208,7 @@ func serve() {
 	}()
 
 	if err := server.ListenAndServe(); err != nil {
-		fmt.Fprintf(os.Stderr, "server: %v\n", err)
+		fmt.Fprintf(os.Stderr, "server: %s\n", auth.RedactSecrets(err.Error(), cfg.BridgeToken))
 		os.Exit(1)
 	}
 }
@@ -227,7 +226,7 @@ func refreshExpiring(ctx context.Context) {
 		fmt.Printf("[jwt-refresh] account %s (%s) expiring — refreshing\n", a.ID, a.Label)
 		newExpiry, err := accounts.TryRefreshAccount(ctx, a.ID)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[jwt-refresh] account %s refresh failed: %v — re-login required\n", a.ID, err)
+			fmt.Fprintf(os.Stderr, "[jwt-refresh] account %s refresh failed: %s — re-login required\n", a.ID, auth.RedactSecrets(err.Error(), a.JWT, a.RefreshToken))
 			continue
 		}
 		fmt.Printf("[jwt-refresh] account %s refreshed, new expiry %s\n",
