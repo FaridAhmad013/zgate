@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -34,18 +35,25 @@ func setupBenchEnv(b testing.TB) func() {
 	prevMid := os.Getenv("ZCODE_IDENTITY_DEVICE_MID")
 	prevRate := os.Getenv("ZCODE_RATE_LIMIT_RPS")
 	prevLane := os.Getenv("ZCODE_LANE_WIDTH")
+	prevAcctConc := os.Getenv("ZCODE_ACCOUNT_CONCURRENCY")
 	prevLog := os.Getenv("ZCODE_ACCESS_LOG")
 
 	_ = os.Setenv("ZCODE_ACCOUNTS_FILE", filepath.Join(dir, "accounts.json"))
 	_ = os.Setenv("ZCODE_IDENTITY_DEVICE_MID", "bench-device-mid-0001")
 	_ = os.Setenv("ZCODE_RATE_LIMIT_RPS", "0")
 	_ = os.Setenv("ZCODE_LANE_WIDTH", "128")
+	_ = os.Setenv("ZCODE_ACCOUNT_CONCURRENCY", "128")
 	_ = os.Setenv("ZCODE_ACCESS_LOG", "0")
 
 	jwt1 := fakeJWT("bench_u1")
 	jwt2 := fakeJWT("bench_u2")
 	_, _ = accounts.UpsertAccount("b1", "Bench-1", jwt1, "rt_bench_1", "at_1", time.Now().Add(24*time.Hour).UnixMilli())
 	_, _ = accounts.UpsertAccount("b2", "Bench-2", jwt2, "rt_bench_2", "at_2", time.Now().Add(24*time.Hour).UnixMilli())
+
+	// Advance past the 25ms post-write verification window so benchmarks measure
+	// steady-state in-memory cache performance.
+	time.Sleep(30 * time.Millisecond)
+	_ = accounts.Usable(nil)
 
 	Configure(Config{Port: 0, Host: "127.0.0.1", BridgeToken: "", ModelsCache: 5 * time.Minute})
 
@@ -54,6 +62,7 @@ func setupBenchEnv(b testing.TB) func() {
 		_ = os.Setenv("ZCODE_IDENTITY_DEVICE_MID", prevMid)
 		_ = os.Setenv("ZCODE_RATE_LIMIT_RPS", prevRate)
 		_ = os.Setenv("ZCODE_LANE_WIDTH", prevLane)
+		_ = os.Setenv("ZCODE_ACCOUNT_CONCURRENCY", prevAcctConc)
 		_ = os.Setenv("ZCODE_ACCESS_LOG", prevLog)
 	}
 }
@@ -338,10 +347,30 @@ func percentile(sorted []time.Duration, p float64) float64 {
 	return float64(sorted[idx].Microseconds()) / 1000.0
 }
 
-func medianFloat(vals []float64) float64 {
+func statsFloat(vals []float64) (median, minVal, maxVal, cvPct float64) {
+	if len(vals) == 0 {
+		return 0, 0, 0, 0
+	}
 	cp := append([]float64(nil), vals...)
 	sort.Float64s(cp)
-	return cp[len(cp)/2]
+	median = cp[len(cp)/2]
+	minVal = cp[0]
+	maxVal = cp[len(cp)-1]
+	var sum float64
+	for _, v := range cp {
+		sum += v
+	}
+	mean := sum / float64(len(cp))
+	if mean > 0 {
+		var sqDiff float64
+		for _, v := range cp {
+			d := v - mean
+			sqDiff += d * d
+		}
+		stddev := math.Sqrt(sqDiff / float64(len(cp)))
+		cvPct = (stddev / mean) * 100.0
+	}
+	return median, minVal, maxVal, cvPct
 }
 
 func TestRunBaselineAndStressSuite(t *testing.T) {
@@ -546,13 +575,15 @@ func TestRunBaselineAndStressSuite(t *testing.T) {
 		}
 	}
 
-	run3Median := func(name, path, body string, totalReqs, concurrency, laneWidth int) {
-		const runs = 3
+	run5Stats := func(name, path, body string, totalReqs, concurrency, laneWidth int) {
+		const runs = 5
 		var rps, avg, p50, p95, p99, qp50, qp95, pp50, pp95 []float64
 		var last benchSummary
+		totalErrs := 0
 		for r := 1; r <= runs; r++ {
 			s := runOnce(name, path, body, totalReqs, concurrency, laneWidth)
 			last = s
+			totalErrs += s.Errors
 			rps = append(rps, s.RPS)
 			avg = append(avg, s.AvgMs)
 			p50 = append(p50, s.P50Ms)
@@ -563,23 +594,31 @@ func TestRunBaselineAndStressSuite(t *testing.T) {
 			pp50 = append(pp50, s.ProcP50Ms)
 			pp95 = append(pp95, s.ProcP95Ms)
 		}
-		t.Logf("MEDIAN(3) %-36s | RPS=%7.1f (runs: %.0f,%.0f,%.0f) | total p50=%5.2fms p95=%6.2fms p99=%6.2fms | queue p50=%5.2fms p95=%6.2fms | proc p50=%5.2fms p95=%5.2fms | heap=%4dKB gor=%d err=%d",
-			name, medianFloat(rps), rps[0], rps[1], rps[2],
-			medianFloat(p50), medianFloat(p95), medianFloat(p99),
-			medianFloat(qp50), medianFloat(qp95),
-			medianFloat(pp50), medianFloat(pp95),
-			last.HeapAllocKB, last.Goroutines, last.Errors)
+		medRPS, minRPS, maxRPS, cvRPS := statsFloat(rps)
+		medP50, _, _, _ := statsFloat(p50)
+		medP95, _, _, _ := statsFloat(p95)
+		medP99, _, _, _ := statsFloat(p99)
+		medQP50, _, _, _ := statsFloat(qp50)
+		medQP95, _, _, _ := statsFloat(qp95)
+		medPP50, _, _, _ := statsFloat(pp50)
+		medPP95, _, _, _ := statsFloat(pp95)
+		t.Logf("RUNS(5) %-36s | medRPS=%7.1f [min=%.0f max=%.0f CV=%.1f%% runs:%.0f,%.0f,%.0f,%.0f,%.0f] | total p50=%5.2fms p95=%6.2fms p99=%6.2fms | queue p50=%5.2fms p95=%6.2fms | proc p50=%5.2fms p95=%5.2fms | heap=%4dKB gor=%d err=%d",
+			name, medRPS, minRPS, maxRPS, cvRPS, rps[0], rps[1], rps[2], rps[3], rps[4],
+			medP50, medP95, medP99,
+			medQP50, medQP95,
+			medPP50, medPP95,
+			last.HeapAllocKB, last.Goroutines, totalErrs)
 	}
 
-	// 1. Core Scenarios (3x repeated, concurrency=10, laneWidth=64, 300 reqs/run)
+	// 1. Core Scenarios (5x repeated, concurrency=10, laneWidth=64, 250 reqs/run)
 	img64 := "data:image/png;base64," + strings.Repeat("iVBORw0KGgoAAAANSUhEUgAAAAUA", 128)
-	run3Median("OpenAI Non-Streaming", "/v1/chat/completions", `{"model":"glm-5.3-flash","messages":[{"role":"user","content":"Hello"}]}`, 300, 10, 64)
-	run3Median("Anthropic Non-Streaming", "/v1/messages", `{"model":"glm-5.3-flash","max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}`, 300, 10, 64)
-	run3Median("OpenAI Streaming (Small Chunks)", "/v1/chat/completions", `{"model":"glm-5.3-flash","stream":true,"messages":[{"role":"user","content":"Hello"}]}`, 300, 10, 64)
-	run3Median("OpenAI Streaming (4KB Chunks)", "/v1/chat/completions", `{"model":"glm-5.3-flash","stream":true,"messages":[{"role":"user","content":"large-chunks"}]}`, 300, 10, 64)
-	run3Median("Anthropic Streaming", "/v1/messages", `{"model":"glm-5.3-flash","stream":true,"max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}`, 300, 10, 64)
-	run3Median("Tool Calling (OpenAI)", "/v1/chat/completions", `{"model":"glm-5.3-flash","messages":[{"role":"user","content":"Weather?"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}]}`, 300, 10, 64)
-	run3Median("Image Payload (Base64)", "/v1/chat/completions", fmt.Sprintf(`{"model":"glm-5.3-flash","messages":[{"role":"user","content":[{"type":"text","text":"Describe"},{"type":"image_url","image_url":{"url":"%s"}}]}]}`, img64), 300, 10, 64)
+	run5Stats("OpenAI Non-Streaming", "/v1/chat/completions", `{"model":"glm-5.3-flash","messages":[{"role":"user","content":"Hello"}]}`, 250, 10, 64)
+	run5Stats("Anthropic Non-Streaming", "/v1/messages", `{"model":"glm-5.3-flash","max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}`, 250, 10, 64)
+	run5Stats("OpenAI Streaming (Small Chunks)", "/v1/chat/completions", `{"model":"glm-5.3-flash","stream":true,"messages":[{"role":"user","content":"Hello"}]}`, 250, 10, 64)
+	run5Stats("OpenAI Streaming (4KB Chunks)", "/v1/chat/completions", `{"model":"glm-5.3-flash","stream":true,"messages":[{"role":"user","content":"large-chunks"}]}`, 250, 10, 64)
+	run5Stats("Anthropic Streaming", "/v1/messages", `{"model":"glm-5.3-flash","stream":true,"max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}`, 250, 10, 64)
+	run5Stats("Tool Calling (OpenAI)", "/v1/chat/completions", `{"model":"glm-5.3-flash","messages":[{"role":"user","content":"Weather?"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}]}`, 250, 10, 64)
+	run5Stats("Image Payload (Base64)", "/v1/chat/completions", fmt.Sprintf(`{"model":"glm-5.3-flash","messages":[{"role":"user","content":[{"type":"text","text":"Describe"},{"type":"image_url","image_url":{"url":"%s"}}]}]}`, img64), 250, 10, 64)
 
 	// 2. Streaming TTFB & Inter-Chunk Latency Measurement
 	_ = os.Setenv("ZCODE_LANE_WIDTH", "16")
@@ -607,14 +646,14 @@ func TestRunBaselineAndStressSuite(t *testing.T) {
 	t.Logf("STREAM TIMING | TTFB=%v | chunks=%d | p50_inter_chunk=%.2fms | p95_inter_chunk=%.2fms | total=%v",
 		ttfb, len(interChunk), percentile(interChunk, 0.50), percentile(interChunk, 0.95), time.Since(t0))
 
-	// 3. Lane Width Comparison (3x repeated: ZCODE_LANE_WIDTH = 1, 2, 4, 8 with 16 concurrent callers, 5ms upstream work)
+	// 3. Lane Width Comparison (5x repeated: ZCODE_LANE_WIDTH = 1, 2, 4, 8 with 16 concurrent callers, 5ms upstream work)
 	for _, lw := range []int{1, 2, 4, 8} {
-		run3Median(fmt.Sprintf("LaneWidth=%d (16 conc, 5ms upstream)", lw), "/v1/chat/completions", `{"model":"glm-5.3-flash","messages":[{"role":"user","content":"paced-work"}]}`, 160, 16, lw)
+		run5Stats(fmt.Sprintf("LaneWidth=%d (16 conc, 5ms upstream)", lw), "/v1/chat/completions", `{"model":"glm-5.3-flash","messages":[{"role":"user","content":"paced-work"}]}`, 128, 16, lw)
 	}
 
-	// 4. Concurrency Scaling / Stress Test (3x repeated: 5, 10, 25, 50, 100 concurrent callers, laneWidth=128)
+	// 4. Concurrency Scaling / Stress Test (5x repeated: 5, 10, 25, 50, 100 concurrent callers, laneWidth=128)
 	for _, conc := range []int{5, 10, 25, 50, 100} {
-		run3Median(fmt.Sprintf("Stress Concurrency=%d (Stream)", conc), "/v1/chat/completions", `{"model":"glm-5.3-flash","stream":true,"messages":[{"role":"user","content":"Hello"}]}`, 400, conc, 128)
+		run5Stats(fmt.Sprintf("Stress Concurrency=%d (Stream)", conc), "/v1/chat/completions", `{"model":"glm-5.3-flash","stream":true,"messages":[{"role":"user","content":"Hello"}]}`, 300, conc, 128)
 	}
 
 	// 5. Resource-Constrained Go Runtime Simulation (GOMAXPROCS=1/512MB, GOMAXPROCS=1/1GB, GOMAXPROCS=2/2GB)
@@ -638,7 +677,7 @@ func TestRunBaselineAndStressSuite(t *testing.T) {
 		runtime.GC()
 		var idleMem runtime.MemStats
 		runtime.ReadMemStats(&idleMem)
-		run3Median(fmt.Sprintf("%s (idleHeap=%dKB)", prof.label, idleMem.HeapAlloc/1024), "/v1/chat/completions", `{"model":"glm-5.3-flash","stream":true,"messages":[{"role":"user","content":"Hello"}]}`, 200, 10, 16)
+		run5Stats(fmt.Sprintf("%s (idleHeap=%dKB)", prof.label, idleMem.HeapAlloc/1024), "/v1/chat/completions", `{"model":"glm-5.3-flash","stream":true,"messages":[{"role":"user","content":"Hello"}]}`, 200, 10, 16)
 	}
 
 	t.Logf("MAX UPSTREAM CONNS OBSERVED=%d | FINAL GOROUTINES=%d", atomic.LoadInt32(&maxUpstreamConns), runtime.NumGoroutine())

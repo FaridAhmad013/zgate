@@ -415,7 +415,8 @@ func SendAnthropic(o SendOpts) (*http.Response, error) {
 	}
 	// Pre-flight check outside the lane so missing credentials fail fast
 	// without acquiring or holding a lane slot.
-	if _, err := Candidates(o.JWT, o.AccountID); err != nil {
+	preflight, err := Candidates(o.JWT, o.AccountID)
+	if err != nil {
 		return nil, err
 	}
 
@@ -430,12 +431,6 @@ func SendAnthropic(o SendOpts) (*http.Response, error) {
 		}
 	}()
 
-	// Re-resolve candidates inside the lane so cooldowns or token refreshes
-	// performed by an earlier lane holder are immediately visible.
-	cands, err := Candidates(o.JWT, o.AccountID)
-	if err != nil {
-		return nil, err
-	}
 	headerTimeout := resolveHeaderTimeout(o)
 	idleTimeout := resolveIdleTimeout(o)
 	client := o.HTTP
@@ -443,42 +438,64 @@ func SendAnthropic(o SendOpts) (*http.Response, error) {
 		client = sharedClient
 	}
 
+	// Explicit JWT override or legacy single-token fallback (no stored account ID).
+	if strings.TrimSpace(o.JWT) != "" || (len(preflight) == 1 && preflight[0].ID == "") {
+		res, err := runAccount(ctx, client, preflight[0], o, headerTimeout, idleTimeout, false)
+		if err != nil {
+			if ue, ok := err.(*UpstreamError); ok {
+				return nil, ue
+			}
+			return nil, &UpstreamError{Msg: err.Error(), Status: 502, Kind: "upstream"}
+		}
+		if cb, ok := res.Body.(*cancelBody); ok {
+			cb.release = releaseLane
+		} else {
+			res.Body = &cancelBody{ReadCloser: res.Body, release: releaseLane}
+		}
+		laneTransferred = true
+		return res, nil
+	}
+
 	var lastErr *UpstreamError
 	tried := map[string]bool{}
 	for attempt := 0; ; attempt++ {
-		var acct *candidate
-		remaining := 0
-		for i := range cands {
-			key := cands[i].ID
-			if key == "" {
-				key = fmt.Sprintf("legacy#%d", i)
-			}
-			if !tried[key] {
-				if acct == nil {
-					acct = &cands[i]
-					tried[key] = true
-				} else {
-					remaining++
-				}
-			}
-		}
-		if acct == nil {
+		storedAcct, remaining, releaseAcct, acqErr := accounts.AcquireCandidate(ctx, o.AccountID, tried)
+		if errors.Is(acqErr, accounts.ErrNoUsableAccount) {
 			break
 		}
+		if acqErr != nil {
+			return nil, &UpstreamError{Msg: "client went away", Status: 499, Kind: "upstream"}
+		}
+		tried[storedAcct.ID] = true
+		acct := candidate{
+			ID:          storedAcct.ID,
+			Label:       storedAcct.Label,
+			JWT:         storedAcct.JWT,
+			DeviceID:    storedAcct.DeviceID,
+			SessionSeed: storedAcct.SessionSeed,
+			UserID:      storedAcct.UserID,
+		}
 		hasMoreAccounts := remaining > 0
-		res, err := runAccount(ctx, client, *acct, o, headerTimeout, idleTimeout, hasMoreAccounts)
+		res, err := runAccount(ctx, client, acct, o, headerTimeout, idleTimeout, hasMoreAccounts)
 		if err == nil {
-			if acct.ID != "" {
-				accounts.ClearCooldown(acct.ID)
+			accounts.ClearCooldown(acct.ID)
+			combinedRelease := func() {
+				releaseAcct()
+				releaseLane()
 			}
 			if cb, ok := res.Body.(*cancelBody); ok {
-				cb.release = releaseLane
+				cb.release = combinedRelease
 			} else {
-				res.Body = &cancelBody{ReadCloser: res.Body, release: releaseLane}
+				res.Body = &cancelBody{ReadCloser: res.Body, release: combinedRelease}
 			}
 			laneTransferred = true
 			return res, nil
 		}
+
+		// Release the failed account's concurrency slot immediately before
+		// marking cooldown or rotating to the next candidate.
+		releaseAcct()
+
 		ue, ok := err.(*UpstreamError)
 		if !ok {
 			ue = &UpstreamError{Msg: err.Error(), Status: 502, Kind: "upstream"}
@@ -487,25 +504,22 @@ func SendAnthropic(o SendOpts) (*http.Response, error) {
 		if !ue.AccountSwitch {
 			return nil, ue // global failure: no point switching
 		}
-		if acct.ID != "" {
-			switch {
-			case ue.Status == http.StatusUnauthorized || ue.Status == http.StatusForbidden:
-				accounts.MarkReauth(acct.ID)
-			case codeIs(ue.Code, 3008):
-				// 3008 is transient account concurrency (desktop app active), not
-				// quota exhaustion. Never lock out a single-account setup; when
-				// multiple accounts exist, apply only a brief cooldown so the next
-				// request prefers an idle account.
-				if len(cands) > 1 {
-					accounts.MarkCooldown(acct.ID, concurrencyCooldown())
-				}
-			case codeIs(ue.Code, 1113) || (ue.Status == http.StatusTooManyRequests && !codeIs(ue.Code, 3009)):
-				accounts.MarkCooldown(acct.ID, 0)
-			default:
-				accounts.MarkCooldown(acct.ID, 2*time.Minute)
+		switch {
+		case ue.Status == http.StatusUnauthorized || ue.Status == http.StatusForbidden:
+			accounts.MarkReauth(acct.ID)
+		case codeIs(ue.Code, 3008):
+			// 3008 is transient account concurrency (desktop app active), not
+			// quota exhaustion. Never lock out a single-account setup; when
+			// multiple accounts exist, apply only a brief cooldown so the next
+			// request prefers an idle account.
+			if attempt > 0 || remaining > 0 {
+				accounts.MarkCooldown(acct.ID, concurrencyCooldown())
 			}
+		case codeIs(ue.Code, 1113) || (ue.Status == http.StatusTooManyRequests && !codeIs(ue.Code, 3009)):
+			accounts.MarkCooldown(acct.ID, 0)
+		default:
+			accounts.MarkCooldown(acct.ID, 2*time.Minute)
 		}
-		_ = attempt
 	}
 	if lastErr != nil {
 		return nil, lastErr

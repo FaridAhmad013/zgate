@@ -40,7 +40,10 @@ import (
 
 // ErrCorruptStore indicates that accounts.json exists on disk but contains
 // invalid or truncated JSON. Mutating operations refuse to overwrite it.
-var ErrCorruptStore = errors.New("corrupt accounts store")
+var (
+	ErrCorruptStore    = errors.New("corrupt accounts store")
+	ErrNoUsableAccount = errors.New("no usable account")
+)
 
 // Account is one stored plan authorization.
 type Account struct {
@@ -86,11 +89,17 @@ type refreshCall struct {
 
 var (
 	mu              sync.Mutex
-	runtime         = map[string]*state{} // id -> live cooldown state (not persisted)
+	runtime         = map[string]*state{} // id -> live cooldown & concurrency state (not persisted)
 	inflightRefresh = map[string]*refreshCall{}
+	slotWaiters     []chan struct{}
+	selectSeq       uint64
 	lastGoodStore   *store
 	lastGoodPath    string
 	lastGoodRaw     []byte
+	lastGoodModTime time.Time
+	lastGoodSize    int64
+	lastStatAt      time.Time
+	lastWriteAt     time.Time
 	lastStoreErr    error
 	renameFile      = os.Rename
 )
@@ -98,6 +107,39 @@ var (
 type state struct {
 	cooldownUntil time.Time
 	failures      int
+	inFlight      int
+	seq           uint64
+}
+
+func stateOf(id string) *state {
+	st := runtime[id]
+	if st == nil {
+		st = &state{}
+		runtime[id] = st
+	}
+	return st
+}
+
+func notifySlotWaitersLocked() {
+	if len(slotWaiters) == 0 {
+		return
+	}
+	for _, ch := range slotWaiters {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+	slotWaiters = slotWaiters[:0]
+}
+
+// AccountConcurrencyLimit returns the maximum concurrent active requests
+// allowed on a single stored account (ZCODE_ACCOUNT_CONCURRENCY, default 1).
+func AccountConcurrencyLimit() int {
+	if n := envMs("ZCODE_ACCOUNT_CONCURRENCY", 1); n > 0 {
+		return int(n)
+	}
+	return 1
 }
 
 func cooldownDefault() time.Duration {
@@ -177,11 +219,34 @@ func backupCorruptFile(path string, raw []byte) (string, error) {
 // (alongside any previously cached in-memory accounts for read-only callers).
 func loadStore() (store, error) {
 	path := AccountsFile()
+	now := time.Now()
+
+	// Fast Path 1: Under steady-state concurrent load (>25ms after any write),
+	// suppress redundant os.Stat syscalls within a 5ms window.
+	if lastGoodStore != nil && lastGoodPath == path && lastStoreErr == nil &&
+		!lastWriteAt.IsZero() && now.Sub(lastWriteAt) > 25*time.Millisecond &&
+		!lastStatAt.IsZero() && now.Sub(lastStatAt) < 5*time.Millisecond {
+		return cloneStore(*lastGoodStore), nil
+	}
+
+	// Fast Path 2: Check file metadata via os.Stat without reading or JSON-parsing
+	// the file when ModTime and Size are unchanged (>25ms after any write so
+	// same-tick unit-test overwrites still hit the byte-comparison path below).
+	info, statErr := os.Stat(path)
+	if statErr == nil && lastGoodStore != nil && lastGoodPath == path && lastStoreErr == nil &&
+		!lastGoodModTime.IsZero() && info.ModTime().Equal(lastGoodModTime) && info.Size() == lastGoodSize &&
+		!lastWriteAt.IsZero() && now.Sub(lastWriteAt) > 25*time.Millisecond {
+		lastStatAt = now
+		return cloneStore(*lastGoodStore), nil
+	}
+
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			lastStoreErr = nil
 			lastGoodRaw = nil
+			lastGoodModTime = time.Time{}
+			lastGoodSize = 0
 			empty := store{Version: 1, Accounts: []Account{}}
 			return empty, nil
 		}
@@ -193,6 +258,11 @@ func loadStore() (store, error) {
 	}
 
 	if lastGoodStore != nil && lastGoodPath == path && lastStoreErr == nil && len(lastGoodRaw) > 0 && bytes.Equal(raw, lastGoodRaw) {
+		if statErr == nil {
+			lastGoodModTime = info.ModTime()
+			lastGoodSize = info.Size()
+		}
+		lastStatAt = now
 		return cloneStore(*lastGoodStore), nil
 	}
 
@@ -205,6 +275,7 @@ func loadStore() (store, error) {
 			lastStoreErr = fmt.Errorf("%w: %w", ErrCorruptStore, errors.New(path))
 		}
 		lastGoodRaw = nil
+		lastGoodModTime = time.Time{}
 		if lastGoodStore != nil && lastGoodPath == path {
 			return cloneStore(*lastGoodStore), lastStoreErr
 		}
@@ -218,6 +289,15 @@ func loadStore() (store, error) {
 	lastGoodStore = &cp
 	lastGoodPath = path
 	lastGoodRaw = append(lastGoodRaw[:0], raw...)
+	if statErr == nil {
+		lastGoodModTime = info.ModTime()
+		lastGoodSize = info.Size()
+	} else if st, err := os.Stat(path); err == nil {
+		lastGoodModTime = st.ModTime()
+		lastGoodSize = st.Size()
+	}
+	lastStatAt = now
+	lastWriteAt = now
 	lastStoreErr = nil
 	return rec, nil
 }
@@ -280,13 +360,20 @@ func writeStore(rec store) error {
 		lastStoreErr = err
 		return err
 	}
-	if info, err := os.Stat(path); err == nil && info.Mode().Perm() != 0o600 {
-		_ = os.Chmod(path, 0o600)
+	if info, err := os.Stat(path); err == nil {
+		if info.Mode().Perm() != 0o600 {
+			_ = os.Chmod(path, 0o600)
+		}
+		lastGoodModTime = info.ModTime()
+		lastGoodSize = info.Size()
 	}
+	now := time.Now()
 	cp := cloneStore(rec)
 	lastGoodStore = &cp
 	lastGoodPath = path
 	lastGoodRaw = append(lastGoodRaw[:0], raw...)
+	lastStatAt = now
+	lastWriteAt = now
 	lastStoreErr = nil
 	return nil
 }
@@ -451,10 +538,12 @@ func Remove(id string) bool {
 	if err := writeStore(rec); err != nil {
 		return false
 	}
+	delete(runtime, id)
+	notifySlotWaitersLocked()
 	return true
 }
 
-// SetDefault pins one account as the rotation head.
+// SetDefault pins one account as the rotation head and resets round-robin sequence.
 func SetDefault(id string) bool {
 	mu.Lock()
 	defer mu.Unlock()
@@ -466,6 +555,10 @@ func SetDefault(id string) bool {
 		return false
 	}
 	rec.Default = id
+	selectSeq = 0
+	for _, st := range runtime {
+		st.seq = 0
+	}
 	return writeStore(rec) == nil
 }
 
@@ -482,26 +575,10 @@ func cooledDown(id string, now time.Time) bool {
 	return st != nil && st.cooldownUntil.After(now)
 }
 
-// Usable returns the accounts a new attempt may use, default first. Expired
-// JWTs are skipped (and flagged) so rotation never parks on a dead token.
-// Tokens without an `exp` claim have ExpiresAt == 0 and are NOT treated as expired.
-func Usable(exclude map[string]bool) []Account {
-	mu.Lock()
-	defer mu.Unlock()
-	rec, _ := loadStore()
+func usableLocked(rec store, exclude map[string]bool) []Account {
 	now := time.Now()
 	out := make([]Account, 0, len(rec.Accounts))
-	ordered := append([]Account(nil), rec.Accounts...)
-	sort.SliceStable(ordered, func(i, j int) bool {
-		if ordered[i].ID == rec.Default {
-			return true
-		}
-		if ordered[j].ID == rec.Default {
-			return false
-		}
-		return false
-	})
-	for _, a := range ordered {
+	for _, a := range rec.Accounts {
 		if exclude[a.ID] || a.NeedsReauth || cooledDown(a.ID, now) {
 			continue
 		}
@@ -510,7 +587,118 @@ func Usable(exclude map[string]bool) []Account {
 		}
 		out = append(out, a)
 	}
+	sort.SliceStable(out, func(i, j int) bool {
+		stI := runtime[out[i].ID]
+		stJ := runtime[out[j].ID]
+		infI, seqI := 0, uint64(0)
+		if stI != nil {
+			infI, seqI = stI.inFlight, stI.seq
+		}
+		infJ, seqJ := 0, uint64(0)
+		if stJ != nil {
+			infJ, seqJ = stJ.inFlight, stJ.seq
+		}
+		if infI != infJ {
+			return infI < infJ
+		}
+		if seqI != seqJ {
+			return seqI < seqJ
+		}
+		if out[i].ID == rec.Default {
+			return true
+		}
+		if out[j].ID == rec.Default {
+			return false
+		}
+		return false
+	})
 	return out
+}
+
+// Usable returns the accounts a new attempt may use, ordered by least in-flight
+// load, round-robin fairness sequence, and default account tie-breaker. Expired
+// JWTs and cooled-down accounts are skipped.
+func Usable(exclude map[string]bool) []Account {
+	mu.Lock()
+	defer mu.Unlock()
+	rec, _ := loadStore()
+	return usableLocked(rec, exclude)
+}
+
+// AcquireCandidate selects the best usable account not in exclude and acquires
+// one per-account concurrency slot (bounded by AccountConcurrencyLimit()).
+// If all usable accounts are currently at their concurrency limit, it waits
+// until a slot is released or ctx is canceled.
+func AcquireCandidate(ctx context.Context, pinnedID string, exclude map[string]bool) (Account, int, func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return Account{}, 0, nil, err
+		}
+		maxPerAcct := AccountConcurrencyLimit()
+
+		mu.Lock()
+		rec, _ := loadStore()
+		var cands []Account
+		if pinnedID != "" {
+			for _, a := range rec.Accounts {
+				if a.ID == pinnedID && !exclude[a.ID] {
+					cands = []Account{a}
+					break
+				}
+			}
+		}
+		if len(cands) == 0 && pinnedID == "" {
+			cands = usableLocked(rec, exclude)
+		} else if len(cands) == 0 && pinnedID != "" {
+			// If pinned account was not found in store at all, fall back to usable pool;
+			// if it WAS found and already in exclude, no more candidates remain.
+			if !containsID(rec.Accounts, pinnedID) {
+				cands = usableLocked(rec, exclude)
+			}
+		}
+
+		if len(cands) == 0 {
+			mu.Unlock()
+			return Account{}, 0, nil, ErrNoUsableAccount
+		}
+
+		for _, a := range cands {
+			st := stateOf(a.ID)
+			if st.inFlight < maxPerAcct {
+				st.inFlight++
+				selectSeq++
+				st.seq = selectSeq
+				acctID := a.ID
+				remaining := len(cands) - 1
+				var once sync.Once
+				release := func() {
+					once.Do(func() {
+						mu.Lock()
+						if s := runtime[acctID]; s != nil && s.inFlight > 0 {
+							s.inFlight--
+						}
+						notifySlotWaitersLocked()
+						mu.Unlock()
+					})
+				}
+				mu.Unlock()
+				return a, remaining, release, nil
+			}
+		}
+
+		waitCh := make(chan struct{}, 1)
+		slotWaiters = append(slotWaiters, waitCh)
+		mu.Unlock()
+
+		select {
+		case <-waitCh:
+		case <-ctx.Done():
+			return Account{}, 0, nil, ctx.Err()
+		}
+	}
 }
 
 // MarkCooldown parks an account for ms (the default when ms <= 0) and
@@ -522,13 +710,10 @@ func MarkCooldown(id string, ms time.Duration) {
 	if ms <= 0 {
 		ms = cooldownDefault()
 	}
-	st := runtime[id]
-	if st == nil {
-		st = &state{}
-		runtime[id] = st
-	}
+	st := stateOf(id)
 	st.cooldownUntil = time.Now().Add(ms)
 	st.failures++
+	notifySlotWaitersLocked()
 }
 
 // MarkReauth flags the account durably (persists in the file when store is healthy)
@@ -536,7 +721,9 @@ func MarkCooldown(id string, ms time.Duration) {
 func MarkReauth(id string) {
 	mu.Lock()
 	defer mu.Unlock()
-	runtime[id] = &state{cooldownUntil: time.Now().Add(1 << 62)}
+	st := stateOf(id)
+	st.cooldownUntil = time.Now().Add(1 << 62)
+	notifySlotWaitersLocked()
 	rec, err := loadStore()
 	if err != nil {
 		return
@@ -558,6 +745,18 @@ func ClearCooldown(id string) {
 	if st := runtime[id]; st != nil {
 		st.cooldownUntil = time.Time{}
 		st.failures = 0
+	}
+	if lastGoodStore != nil && lastStoreErr == nil {
+		needsWrite := false
+		for i := range lastGoodStore.Accounts {
+			if lastGoodStore.Accounts[i].ID == id && lastGoodStore.Accounts[i].NeedsReauth {
+				needsWrite = true
+				break
+			}
+		}
+		if !needsWrite {
+			return
+		}
 	}
 	rec, err := loadStore()
 	if err != nil {
@@ -722,7 +921,14 @@ func ResetForTest() {
 	defer mu.Unlock()
 	runtime = map[string]*state{}
 	inflightRefresh = map[string]*refreshCall{}
+	notifySlotWaitersLocked()
+	selectSeq = 0
 	lastGoodStore = nil
 	lastGoodPath = ""
+	lastGoodRaw = nil
+	lastGoodModTime = time.Time{}
+	lastGoodSize = 0
+	lastStatAt = time.Time{}
+	lastWriteAt = time.Time{}
 	lastStoreErr = nil
 }

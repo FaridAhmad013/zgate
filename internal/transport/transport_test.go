@@ -189,6 +189,7 @@ func TestMultiAccount3008RotationQuotaExhaustionAndRecovery(t *testing.T) {
 	}
 
 	// 3. Quota exhaustion (1113) parks Account A in quota cooldown and rotates to Account B.
+	accounts.SetDefault("a")
 	bearers = nil
 	failModeA = "1113"
 	mu.Unlock()
