@@ -815,7 +815,7 @@
           </div>
           <div class="daemon-row" style="margin-bottom:0;">
             <span style="color:var(--text-dim);">HOST_ADDR</span>
-            <span id="daemonHostText" style="color:var(--text-main);">127.0.0.1:20131</span>
+            <span id="daemonHostText" style="color:var(--text-main);">Loading...</span>
           </div>
         </div>
       </div>
@@ -833,7 +833,7 @@
           <span class="telemetry-sep">|</span>
           <div class="telemetry-item">
             <span class="telemetry-key">BIND:</span>
-            <span class="telemetry-val" id="headerNodeInfo">127.0.0.1:20131</span>
+            <span class="telemetry-val" id="headerNodeInfo">Loading...</span>
           </div>
           <span class="telemetry-sep">|</span>
           <div class="telemetry-item">
@@ -855,6 +855,9 @@
           <button class="btn" onclick="startLoginModal()">
             + Add Z.ai Account
           </button>
+          <button class="btn btn-secondary" onclick="logoutAdmin()" title="Logout session">
+            Logout
+          </button>
         </div>
       </header>
 
@@ -874,7 +877,7 @@
               <div class="card-body">
                 <div class="field-group">
                   <div class="field-key">BASE_URL</div>
-                  <div class="field-val" id="dashBaseUrl">http://127.0.0.1:20131/v1</div>
+                  <div class="field-val" id="dashBaseUrl">Loading...</div>
                 </div>
                 <div class="field-group">
                   <div class="field-key">PREFIX</div>
@@ -1008,7 +1011,7 @@
               <div class="lcd-bay" style="margin-bottom:16px; line-height:1.9; color:var(--text-muted); font-size:12.5px;">
                 01. Open your 9Router local dashboard.<br>
                 02. Add a new Provider node with <strong style="color:var(--text-main);">API Type: Chat Completions</strong>.<br>
-                03. Set <strong style="color:var(--text-main);">Base URL:</strong> <span id="routeBaseUrl" style="color:var(--led-green);">http://127.0.0.1:20131/v1</span><br>
+                03. Set <strong style="color:var(--text-main);">Base URL:</strong> <span id="routeBaseUrl" style="color:var(--led-green);">Loading...</span><br>
                 04. Set <strong style="color:var(--text-main);">Prefix:</strong> <span style="color:var(--led-amber);">zcode</span><br>
                 05. In the Model mapping field, add <code style="color:var(--text-main);">glm-5.3-flash</code> or <code style="color:var(--text-main);">glm-5.3</code>.
               </div>
@@ -1058,6 +1061,29 @@
   <script>
     let pollInterval = null;
     let actualBridgeToken = '';
+    let lastUserActivity = Date.now();
+    const INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes inactivity ceiling
+
+    function recordActivity() {
+      lastUserActivity = Date.now();
+    }
+    ['mousemove', 'mousedown', 'keydown', 'touchstart', 'scroll'].forEach(evt => {
+      window.addEventListener(evt, recordActivity, { passive: true });
+    });
+
+    async function logoutAdmin() {
+      try {
+        await fetch('/api/dashboard/auth/logout', { method: 'POST' });
+      } catch (e) {}
+      window.location.reload();
+    }
+
+    function checkInactivity() {
+      if (Date.now() - lastUserActivity >= INACTIVITY_TIMEOUT_MS) {
+        logoutAdmin();
+      }
+    }
+    setInterval(checkInactivity, 10000);
 
     function switchTab(tabId, el) {
       document.querySelectorAll('.tab-view').forEach(t => t.classList.remove('active'));
@@ -1360,6 +1386,11 @@
     }
 
     window.onload = () => {
+      const base = window.location.origin + '/v1';
+      document.getElementById('dashBaseUrl').textContent = base;
+      document.getElementById('routeBaseUrl').textContent = base;
+      document.getElementById('headerNodeInfo').textContent = window.location.host;
+      document.getElementById('daemonHostText').textContent = window.location.host;
       loadDashboard();
       setInterval(loadDashboard, 5000);
     };

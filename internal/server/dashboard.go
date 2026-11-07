@@ -88,6 +88,26 @@ func isDashboardAuthorized(r *http.Request) bool {
 	return false
 }
 
+// renewDashboardSessionSlide resets the 5-minute inactivity session cookie on active authorized requests.
+func renewDashboardSessionSlide(w http.ResponseWriter, r *http.Request) {
+	adminKey := resolveAdminKey()
+	if adminKey == "" {
+		return
+	}
+	if cookie, err := r.Cookie("gateway_admin_session"); err == nil && cookie != nil {
+		if constantTimeTokenEqual(strings.TrimSpace(cookie.Value), adminKey) {
+			http.SetCookie(w, &http.Cookie{
+				Name:     "gateway_admin_session",
+				Value:    cookie.Value,
+				Path:     "/",
+				HttpOnly: true,
+				SameSite: http.SameSiteLaxMode,
+				MaxAge:   300, // Extend 5 minutes from last active request
+			})
+		}
+	}
+}
+
 const loginPageHTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -289,7 +309,7 @@ func handleDashboardAuthLogin(w http.ResponseWriter, r *http.Request) {
 			Path:     "/",
 			HttpOnly: true,
 			SameSite: http.SameSiteLaxMode,
-			MaxAge:   86400 * 7, // 7 days
+			MaxAge:   300, // 5 minutes (inactivity ceiling)
 		})
 		sendJSON(w, http.StatusOK, map[string]any{"ok": true})
 		return
@@ -328,6 +348,7 @@ func handleDashboardStatus(w http.ResponseWriter, r *http.Request) {
 		sendJSON(w, http.StatusUnauthorized, map[string]any{"ok": false, "error": "Authentication required"})
 		return
 	}
+	renewDashboardSessionSlide(w, r)
 
 	c := getConfig()
 	ring := accounts.Summarize()
